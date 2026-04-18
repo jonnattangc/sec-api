@@ -1,7 +1,7 @@
 services:
     test-api:
-      container_name: test-api
-      image: test:prd
+      container_name: security-api
+      image: security:prd
       build: .
       restart: always
       volumes:
@@ -9,7 +9,7 @@ services:
       ports:
         - "8079:8079"
       env_file:
-        - ../envs/test.env
+        - ../envs/security.env
       networks:
         - db-net
       command: tail -f /home/jonnattan/requirements.txt

@@ -5,22 +5,12 @@ try:
     import sys
     import os
     import time
-    import requests
-    import json
-    from datetime import datetime, timedelta
-    import ssl
-    from flask_cors import CORS
-    
     from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt, decode_token
-
-    from flask_login import LoginManager, UserMixin, current_user, login_required, login_user
-    from flask import Flask, render_template, abort, make_response, request, redirect, jsonify, send_from_directory
+    from flask import Flask, request, jsonify
     from werkzeug.middleware.proxy_fix import ProxyFix
-    from flask_swagger_ui import get_swaggerui_blueprint
     from flasgger import Swagger
+    from flask_cors import CORS
     from security import Security
-    from checker import Checker
-    from coordinator import Coordinator
 
 except ImportError:
 
@@ -58,24 +48,131 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
 template = {
     "openapi": "3.0.1",
     "info": {
-        "title": "API Documentación",
-        "description": "Documentación de mi API con modelos compartidos",
-        "version": "1.0.0"
+        "title": "API de Seguridad OAuth2/JWT",
+        "description": "Servidor de autenticación centralizado con JWT para servicios internos",
+        "version": "1.0.0",
+        "contact": {
+            "name": "Soporte",
+            "email": "jonnattan@gmail.com"
+        }
     },
+    "servers": [
+        {
+            "url": "http://localhost:8079",
+            "description": "Servidor local de desarrollo"
+        }
+    ],
     "components": {
         "schemas": {
-            "MiModelo": {  # <--- AQUÍ DEFINES EL MODELO QUE TE DABA ERROR
+            "LoginRequest": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "example": "usuario"
+                    },
+                    "password": {
+                        "type": "string",
+                        "example": "contraseña_segura"
+                    }
+                }
+            },
+            "User": {
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "integer",
                         "example": 1
                     },
-                    "nombre": {
+                    "username": {
                         "type": "string",
-                        "example": "Juan Perez"
+                        "example": "usuario"
+                    },
+                    "role": {
+                        "type": "string",
+                        "example": "user"
+                    },
+                    "status": {
+                        "type": "string",
+                        "example": "ACTIVE"
+                    },
+                    "last_login": {
+                        "type": "string",
+                        "format": "date-time",
+                        "example": "2026-04-19T10:30:00"
                     }
                 }
+            },
+            "Client": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "example": 1
+                    },
+                    "company": {
+                        "type": "string",
+                        "example": "Mi Empresa"
+                    },
+                    "status": {
+                        "type": "string",
+                        "example": "ACTIVE"
+                    }
+                }
+            },
+            "LoginResponse": {
+                "type": "object",
+                "properties": {
+                    "access_token": {
+                        "type": "string",
+                        "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    },
+                    "refresh_token": {
+                        "type": "string",
+                        "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    },
+                    "expires_in": {
+                        "type": "integer",
+                        "example": 300
+                    },
+                    "user": {
+                        "$ref": "#/components/schemas/User"
+                    },
+                    "client": {
+                        "$ref": "#/components/schemas/Client"
+                    }
+                }
+            },
+            "MessageResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "example": "OK"
+                    }
+                }
+            },
+            "ErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "example": "No autorizado"
+                    }
+                }
+            }
+        },
+        "securitySchemes": {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT"
+            },
+            "ApiKeyAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "x-api-key"
             }
         }
     }
@@ -84,22 +181,22 @@ template = {
 
 
 app.config['SWAGGER'] = {
-    'title': 'API Documentación',
+    'title': 'API de Seguridad OAuth2/JWT',
     'uiversion': 3,
-    'openapi': '3.0.1', # Forzar versión moderna de OpenAPI
+    'openapi': '3.0.1',
     'specs_route': '/apidocs/',
     'doc_dir': str(ROOT_DIR) + '/docs',
     'static_url_path': '/flasgger_static',
     'specs': [
         {
-            "endpoint": 'apijonna',
-            "route": '/apijonna.json',
+            "endpoint": 'api_oauth',
+            "route": '/api_oauth.json',
             "rule_filter": lambda rule: True,
             "model_filter": lambda tag: True,
         }
     ],
     "headers": [],
-    "schemes": ["https"], 
+    "schemes": ["https", "http"],
     "static_lib_url": "https://unpkg.com/swagger-ui-dist@3/"
 }
 
@@ -112,8 +209,101 @@ jwt = JWTManager(app)
 
 cors = CORS(app, origins=["https://dev.jonnattan.com", "https://api.jonnattan.cl","https://www.jonna.cl","https://www.jonnattan.cl","https://api.jonna.cl","https://docs.jonna.cl","https://docs.jonnattan.cl"])
 
+
+@app.get(f"{CONTEXT_PATH}/validate")
+@jwt_required()
+def validate():
+    """
+    Validar Token JWT
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+    responses:
+      200:
+        description: Token válido
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageResponse'
+      401:
+        description: Token inválido o no autorizado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
+    data_json = {"message": "Validación fallida"}
+    http_status = 401
+    sec = Security()
+    client = sec.get_client(request.headers.get('x-api-key'))
+    if client != None :
+        logger.info(f"Cliente[{client['id']}]: {client['company']}")
+        data_json = {"message": "OK"}
+        http_status = 200
+        jwt = get_jwt()
+        current_user = get_jwt_identity()
+        user = sec.user_exists(current_user)
+        if jwt == None or str(jwt["client"]) != str(client["id"]) :
+            logger.warn(f"Cliente JWT: {jwt["client"]}")
+            data_json = {"message": "Cliente y/o usuario no autorizado"}
+            http_status = 401
+        # verificar el rol del usuario por si fue modificado en el front
+        if user == None or str(jwt["role"]).lower() != str(user["role"]).lower() :
+            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            data_json = {"message": "Rol o usuario no autorizado"}
+            http_status = 401
+        # verifico si el token es valido, es decir no se ha caducado por otro lado
+        if sec.is_token_valid( jwt ) == False :
+            data_json = {"message": "Token no autorizado"}
+            http_status = 401
+    del sec
+    return jsonify(data_json), http_status
+
+
 @app.post(f"{CONTEXT_PATH}/login")
 def login():
+    """
+    Iniciar Sesión - Obtener Tokens JWT
+    ---
+    tags:
+      - Autenticación
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LoginRequest'
+    responses:
+      200:
+        description: Autenticación exitosa
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginResponse'
+      401:
+        description: Credenciales inválidas o cliente no autorizado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
@@ -129,48 +319,86 @@ def login():
 @app.get(f"{CONTEXT_PATH}/refresh")
 @jwt_required(refresh=True)
 def refresh():
+    """
+    Refrescar Token de Acceso
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+      - in: header
+        name: Authorization
+        required: true
+        schema:
+          type: string
+        description: Refresh token en formato "Bearer {token}"
+    responses:
+      200:
+        description: Token refrescado exitosamente
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginResponse'
+      401:
+        description: Refresh token inválido o expirado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
-        logger.info(f"Cliente: {client['company']}")
+        logger.info(f"Cliente[{client['id']}]: {client['company']}")
         user_name = get_jwt_identity()
         user = sec.user_exists(user_name)
-        valid_token = sec.is_refresh_token_valid( get_jwt() )
+        jwt = get_jwt()
+        logger.info(f"JWT REFRESH: {jwt}")
+        if jwt == None or str(jwt["client"]) != str(client["id"]) :
+            logger.warn(f"Cliente JWT: {jwt['client']}")
+            data_json = {"message": "Cliente y/o usuario no autorizado"}
+            http_status = 401
+        # verificar el rol del usuario por si fue modificado en el front
+        if user == None or jwt == None or str(jwt["role"]).lower() != str(user["role"]).lower()  :
+            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            return jsonify({"message": "Rol o usuario no autorizado para el refresh"}), 401
+        valid_token = sec.is_refresh_token_valid( jwt )
         if valid_token == False :
-            return jsonify({"message": "Token Invalido"}), 401
-        return process_response_jwt( user )
+            return jsonify({"message": "Invalid Refresh Token"}), 401
+        return process_response_jwt( user, client )
     del sec
     return jsonify({"message": "No autorizado"}), 401
 
 def process_response_jwt( user : dict, client : dict = None ) :
     if user == None :
         return jsonify({"message": f"usuario inválido"}), 401
-    
-    if "password" in user :
+    try :
         del user["password"]
-
-    if "apikey" in client :
-        del client["apikey"]
-
-    if "mail_pass" in client :
+    except :
+        pass
+    try :
         del client["mail_pass"]
-
-
+    except :
+        pass
     claims : dict = {
-        "client"       : str(client["id"]),
-        "role"          : str(user["role"]).lower()
+        "client" : str(client["id"]),
+        "role"   : str(user["role"]).lower()
     }
-
     username : str = str(user["username"])
     access_token : str = create_access_token(identity=username, additional_claims=claims)
     token_data : dict = decode_token(access_token)
-    refresh_token : str = create_refresh_token(identity=username)
+    refresh_token : str = create_refresh_token(identity=username, additional_claims=claims)
     refresh_token_id : str = decode_token(refresh_token)["jti"]
-
     sec = Security()
     sec.save_token(username, token_data, refresh_token_id, access_token)
     del sec
-    
     response = {
         "access_token"  : access_token,
         "refresh_token" : refresh_token,
@@ -197,6 +425,40 @@ def unauthorized_callback(error):
 @app.delete(f"{CONTEXT_PATH}/logout")
 @jwt_required()
 def logout():
+    """
+    Cerrar Sesión - Revocar Token
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+      - in: header
+        name: Authorization
+        required: true
+        schema:
+          type: string
+        description: Token de acceso en formato "Bearer {token}"
+    responses:
+      200:
+        description: Sesión cerrada exitosamente
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageResponse'
+      401:
+        description: Token no válido o no proporcionado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     jti = get_jwt()["jti"]
     sec = Security()
     sec.delete_token(jti)
@@ -210,35 +472,6 @@ def check_if_token_revoked(jwt_header, jwt_payload: dict):
     logger.info(f"Token revoked: {status}")
     del sec
     return status
-
-@app.get(f"{CONTEXT_PATH}/validate")
-@jwt_required()
-def validate():
-    data_json = {"message": "Validación fallida"}
-    http_status = 401
-    sec = Security()
-    client = sec.get_client(request.headers.get('x-api-key'))
-    if client != None :
-        logger.info(f"Cliente: {client['company']}")
-        data_json = {"message": "OK"}
-        http_status = 200
-        jwt = get_jwt()
-        if jwt == None  or jwt["role"] != "query" :
-            data_json = {"message": "Rol no autorizado"}
-            http_status = 401
-        if sec.is_token_valid( jwt ) == False :
-            data_json = {"message": "Token no autorizado"}
-            http_status = 401
-        current_user = get_jwt_identity()
-        if current_user == None :
-            data_json = {"message": "Usuario no encontrado"}
-            http_status = 401
-        user = sec.user_exists(current_user)
-        if user == None :
-            data_json = {"message": "Usuario no encontrado"}
-            http_status = 401
-    del sec
-    return jsonify(data_json), http_status
 
 # ===============================================================================
 # Metodo Principal que levanta el servidor

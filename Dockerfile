@@ -1,11 +1,7 @@
 FROM python:3.14-alpine
 
 LABEL VERSION=1.0
-LABEL DESCRIPCION="Test Server HTTP V1.0"
-
-ENV HOST_BD ''
-ENV USER_BD ''
-ENV PASS_BD ''
+LABEL DESCRIPCION="Secure Server HTTP V1.0"
 
 ENV FLASK_APP app
 
@@ -29,5 +25,4 @@ EXPOSE 8079
 
 CMD [ "python", "server.py", "8079"]
 
-# CMD [ "tail", "-f", "/home/jonnattan/requirements.txt" ]
 # pip freeze > requirements.txt

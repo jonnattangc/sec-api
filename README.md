@@ -1,62 +1,62 @@
-# Security API - OAuth2 Authentication Server
+# API de Seguridad - Servidor OAuth2/JWT
 
-A lightweight Flask-based OAuth2 JWT authentication server that manages user credentials, API client validation, and JWT token lifecycle. Designed for use as a centralized authentication provider for internal services and microservices.
+Servidor ligero basado en Flask para autenticación OAuth2 con JWT que gestiona credenciales de usuarios, validación de clientes API y ciclo de vida de tokens JWT. Diseñado como proveedor centralizado de autenticación para servicios internos y microservicios.
 
-## Features
+## Características
 
-- **User Authentication**: Username/password verification with bcrypt hashing
-- **JWT Token Management**: Access and refresh token generation with configurable TTL
-- **API Key Validation**: Client-based API key authentication
-- **Token Revocation**: Track and revoke tokens via token blacklist
-- **Token Refresh**: Issue new access tokens using refresh tokens
-- **CORS Support**: Configurable cross-origin request handling
-- **Swagger Documentation**: Interactive API documentation via Flasgger
+- **Autenticación de Usuarios**: Verificación de usuario/contraseña con hash bcrypt
+- **Gestión de Tokens JWT**: Generación de tokens de acceso y refresco con TTL configurable
+- **Validación de API Keys**: Autenticación basada en claves de cliente
+- **Revocación de Tokens**: Seguimiento y revocación de tokens mediante lista negra
+- **Refresco de Tokens**: Emisión de nuevos tokens de acceso usando refresh tokens
+- **Soporte CORS**: Manejo configurable de solicitudes entre orígenes
+- **Documentación Swagger**: Documentación interactiva de API vía Flasgger
 
-## Quick Start
+## Inicio Rápido
 
-### Prerequisites
+### Requisitos Previos
 
 - Python 3.10+
 - MySQL 5.7+
-- Docker & Docker Compose (optional)
+- Docker & Docker Compose (opcional)
 
-### Installation
+### Instalación
 
-1. **Clone the repository**
+1. **Clonar el repositorio**
    ```bash
    git clone <repository-url>
    cd sec-api
    ```
 
-2. **Install dependencies**
+2. **Instalar dependencias**
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Configure environment variables**
+3. **Configurar variables de entorno**
    
-   Create a `.env` file or set environment variables:
+   Crear un archivo `.env` o establecer variables de entorno:
    ```bash
-   # Database Configuration
+   # Configuración de Base de Datos
    HOST_BD=localhost
    PORT_BD=3306
    USER_BD=root
    PASS_BD=password
    SCHEMA_BD=oauth_db
    
-   # JWT Configuration
-   SECRET_KEY_JWT=your-super-secret-key-change-in-production
+   # Configuración JWT
+   SECRET_KEY_JWT=tu-clave-super-secreta-cambia-en-produccion
    EXPIRES_TOKEN_IN_SECONDS=300
    
-   # API Configuration
+   # Configuración de API
    CONTEXT_PATH=/oauth
    ```
 
-4. **Set up the database**
+4. **Configurar la base de datos**
    
-   Create the required tables:
+   Crear las tablas requeridas:
    ```sql
-   -- Users table
+   -- Tabla de usuarios
    CREATE TABLE oauth (
      id INT AUTO_INCREMENT PRIMARY KEY,
      username VARCHAR(255) UNIQUE NOT NULL,
@@ -68,7 +68,7 @@ A lightweight Flask-based OAuth2 JWT authentication server that manages user cre
      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
    );
    
-   -- API Clients table
+   -- Tabla de clientes API
    CREATE TABLE clients (
      id INT AUTO_INCREMENT PRIMARY KEY,
      company VARCHAR(255) NOT NULL,
@@ -78,7 +78,7 @@ A lightweight Flask-based OAuth2 JWT authentication server that manages user cre
      create_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
    );
    
-   -- JWT Token tracking table
+   -- Tabla de seguimiento de tokens JWT
    CREATE TABLE user_jwt (
      id VARCHAR(255) PRIMARY KEY,
      user VARCHAR(255) NOT NULL,
@@ -90,62 +90,63 @@ A lightweight Flask-based OAuth2 JWT authentication server that manages user cre
    );
    ```
 
-5. **Run the server**
+5. **Ejecutar el servidor**
    ```bash
    python app/server.py 8079
    ```
    
-   The API will be available at `http://localhost:8079`
+   La API estará disponible en `http://localhost:8079`
    
-   Swagger documentation available at `http://localhost:8079/apidocs/`
+   Documentación Swagger disponible en `http://localhost:8079/apidocs/`
 
-### Docker Deployment
+### Despliegue con Docker
 
-1. **Build the image**
+1. **Construir la imagen**
    ```bash
    docker build -t security:prd .
    ```
 
-2. **Run with docker-compose**
+2. **Ejecutar con docker-compose**
    
-   Create `envs/security.env`:
+   Crear `envs/security.env`:
    ```
    HOST_BD=db
    PORT_BD=3306
    USER_BD=root
    PASS_BD=rootpassword
    SCHEMA_BD=oauth_db
-   SECRET_KEY_JWT=your-secure-key
+   SECRET_KEY_JWT=tu-clave-segura
    EXPIRES_TOKEN_IN_SECONDS=300
+   CONTEXT_PATH=/oauth
    ```
    
-   Start the containers:
+   Iniciar los contenedores:
    ```bash
    docker-compose up -d
    ```
 
-## API Endpoints
+## Endpoints de la API
 
-### 1. Login
+### 1. Iniciar Sesión
 **POST** `/oauth/login`
 
-Authenticate user and obtain JWT tokens.
+Autentica un usuario y obtiene tokens JWT.
 
-**Headers:**
+**Encabezados:**
 ```
-x-api-key: your_api_key
+x-api-key: tu_clave_api
 Content-Type: application/json
 ```
 
-**Request Body:**
+**Cuerpo de la Solicitud:**
 ```json
 {
-  "username": "john_doe",
-  "password": "secure_password"
+  "username": "usuario",
+  "password": "contraseña_segura"
 }
 ```
 
-**Success Response (200):**
+**Respuesta Exitosa (200):**
 ```json
 {
   "access_token": "eyJhbGc...",
@@ -153,62 +154,63 @@ Content-Type: application/json
   "expires_in": 300,
   "user": {
     "id": 1,
-    "username": "john_doe",
+    "username": "usuario",
     "role": "user",
     "status": "ACTIVE",
-    "last_login": "2026-04-18 15:30:00"
+    "last_login": "2026-04-19 10:30:00"
   },
   "client": {
     "id": 1,
-    "company": "Acme Corp",
+    "company": "Mi Empresa",
     "status": "ACTIVE"
   }
 }
 ```
 
-**Error Response (401):**
+**Respuesta de Error (401):**
 ```json
 {
   "message": "No autorizado"
 }
 ```
 
-### 2. Validate Token
+### 2. Validar Token
 **GET** `/oauth/validate`
 
-Verify that a token is valid and user has proper access.
+Verifica que un token sea válido y el usuario tenga acceso adecuado.
 
-**Headers:**
+**Encabezados:**
 ```
 Authorization: Bearer {access_token}
-x-api-key: your_api_key
+x-api-key: tu_clave_api
 ```
 
-**Success Response (200):**
+**Respuesta Exitosa (200):**
 ```json
 {
   "message": "OK"
 }
 ```
 
-**Error Response (401):**
+**Respuesta de Error (401):**
 ```json
 {
   "message": "Token no autorizado"
 }
 ```
 
-### 3. Refresh Token
+### 3. Refrescar Token
 **GET** `/oauth/refresh`
 
-Generate a new access token using a valid refresh token.
+Genera un nuevo token de acceso usando un refresh token válido.
 
-**Headers:**
+**Encabezados:**
 ```
 Authorization: Bearer {refresh_token}
+x-api-key: tu_clave_api
 ```
 
-**Success Response (200):**
+**Respuesta Exitosa (200):**
 ```json
 {
   "access_token": "eyJhbGc...",
@@ -216,142 +218,145 @@ Authorization: Bearer {refresh_token}
   "expires_in": 300,
   "user": {
     "id": 1,
-    "username": "john_doe",
+    "username": "usuario",
     "role": "user",
     "status": "ACTIVE"
   },
   "client": {
     "id": 1,
-    "company": "Acme Corp"
+    "company": "Mi Empresa"
   }
 }
 ```
 
-**Error Response (401):**
+**Respuesta de Error (401):**
 ```json
 {
   "message": "Tu sesión ha expirado"
 }
 ```
 
-### 4. Logout
+### 4. Cerrar Sesión
 **DELETE** `/oauth/logout`
 
-Revoke the current access token and invalidate the session.
+Revoca el token de acceso actual e invalida la sesión.
 
-**Headers:**
+**Encabezados:**
 ```
 Authorization: Bearer {access_token}
+x-api-key: tu_clave_api
 ```
 
-**Success Response (200):**
+**Respuesta Exitosa (200):**
 ```json
 {
-  "message": "Sesión cerrada con exito"
+  "message": "Sesión cerrada con éxito"
 }
 ```
 
-**Error Response (401):**
+**Respuesta de Error (401):**
 ```json
 {
   "message": "No se encontró un token de acceso. Debes iniciar sesión."
 }
 ```
 
-## Authentication Flow
+## Flujo de Autenticación
 
 ```
 ┌─────────────┐
-│   Client    │
+│   Cliente   │
 └──────┬──────┘
        │
-       │ 1. POST /oauth/login (username + password + x-api-key)
+       │ 1. POST /oauth/login (usuario + contraseña + x-api-key)
        ↓
 ┌────────────────────┐
-│  Validate API Key  │
+│  Validar API Key   │
 └────────┬───────────┘
          │
-         │ 2. Check client in clients table
+         │ 2. Buscar cliente en tabla clients
          ↓
 ┌────────────────────────┐
-│ Verify Credentials     │
+│ Verificar Credenciales │
 └────────┬───────────────┘
          │
-         │ 3. Check user in oauth table, verify password hash
+         │ 3. Buscar usuario en tabla oauth, verificar hash
          ↓
 ┌────────────────────┐
-│ Generate JWT Pair  │
+│ Generar JWT Pair   │
 └────────┬───────────┘
          │
-         │ 4. Create access_token + refresh_token
+         │ 4. Crear access_token + refresh_token
          ↓
 ┌────────────────────────────┐
-│ Store Tokens in Database   │
+│ Guardar Tokens en BD       │
 └────────┬───────────────────┘
          │
-         │ 5. Save tokens in user_jwt table
+         │ 5. Guardar tokens en tabla user_jwt
          ↓
 ┌─────────────────────────┐
-│ Return Tokens & User    │
-│ Info to Client          │
+│ Retornar Tokens e Info  │
+│ del Usuario al Cliente  │
 └────────┬────────────────┘
          │
          │ 200 OK + tokens
          ↓
 ┌─────────────┐
-│   Client    │
+│   Cliente   │
 └─────────────┘
 ```
 
-## Usage Examples
+## Ejemplos de Uso
 
-### Using cURL
+### Con cURL
 
-**Login:**
+**Iniciar sesión:**
 ```bash
 curl -X POST http://localhost:8079/oauth/login \
-  -H "x-api-key: your_api_key_here" \
+  -H "x-api-key: tu_clave_api_aqui" \
   -H "Content-Type: application/json" \
   -d '{
-    "username": "john_doe",
-    "password": "secure_password"
+    "username": "usuario",
+    "password": "contraseña_segura"
   }'
 ```
 
-**Validate Token:**
+**Validar token:**
 ```bash
 curl -X GET http://localhost:8079/oauth/validate \
   -H "Authorization: Bearer eyJhbGc..." \
-  -H "x-api-key: your_api_key_here"
+  -H "x-api-key: tu_clave_api_aqui"
 ```
 
-**Refresh Token:**
+**Refrescar token:**
 ```bash
 curl -X GET http://localhost:8079/oauth/refresh \
-  -H "Authorization: Bearer refresh_token_here"
+  -H "Authorization: Bearer refresh_token_aqui" \
+  -H "x-api-key: tu_clave_api_aqui"
 ```
 
-**Logout:**
+**Cerrar sesión:**
 ```bash
 curl -X DELETE http://localhost:8079/oauth/logout \
-  -H "Authorization: Bearer access_token_here"
+  -H "Authorization: Bearer access_token_aqui" \
+  -H "x-api-key: tu_clave_api_aqui"
 ```
 
-### Using Python Requests
+### Con Python
 
 ```python
 import requests
 
 BASE_URL = "http://localhost:8079"
-API_KEY = "your_api_key_here"
+API_KEY = "tu_clave_api_aqui"
 
-# 1. Login
+# 1. Iniciar sesión
 login_response = requests.post(
     f"{BASE_URL}/oauth/login",
     headers={"x-api-key": API_KEY},
     json={
-        "username": "john_doe",
-        "password": "secure_password"
+        "username": "usuario",
+        "password": "contraseña_segura"
     }
 )
 
@@ -359,7 +364,7 @@ tokens = login_response.json()
 access_token = tokens["access_token"]
 refresh_token = tokens["refresh_token"]
 
-# 2. Validate Token
+# 2. Validar token
 validate_response = requests.get(
     f"{BASE_URL}/oauth/validate",
     headers={
@@ -370,41 +375,47 @@ validate_response = requests.get(
 
 print(validate_response.json())
 
-# 3. Refresh Token
+# 3. Refrescar token
 refresh_response = requests.get(
     f"{BASE_URL}/oauth/refresh",
-    headers={"Authorization": f"Bearer {refresh_token}"}
+    headers={
+        "Authorization": f"Bearer {refresh_token}",
+        "x-api-key": API_KEY
+    }
 )
 
 new_access_token = refresh_response.json()["access_token"]
 
-# 4. Logout
+# 4. Cerrar sesión
 logout_response = requests.delete(
     f"{BASE_URL}/oauth/logout",
-    headers={"Authorization": f"Bearer {access_token}"}
+    headers={
+        "Authorization": f"Bearer {access_token}",
+        "x-api-key": API_KEY
+    }
 )
 
 print(logout_response.json())
 ```
 
-## Configuration
+## Configuración
 
-### Environment Variables
+### Variables de Entorno
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST_BD` | - | MySQL database host |
-| `PORT_BD` | 3306 | MySQL database port |
-| `USER_BD` | - | MySQL database user |
-| `PASS_BD` | - | MySQL database password |
-| `SCHEMA_BD` | - | Database schema name |
-| `SECRET_KEY_JWT` | `super-secret-key-aca-debe-ir` | JWT signing key (⚠️ change in production) |
-| `EXPIRES_TOKEN_IN_SECONDS` | 300 | Access token expiration time in seconds |
-| `CONTEXT_PATH` | `/oauth` | Base path for OAuth endpoints |
+| Variable | Por Defecto | Descripción |
+|----------|-------------|-------------|
+| `HOST_BD` | - | Host de la base de datos MySQL |
+| `PORT_BD` | 3306 | Puerto de la base de datos MySQL |
+| `USER_BD` | - | Usuario de la base de datos MySQL |
+| `PASS_BD` | - | Contraseña de la base de datos MySQL |
+| `SCHEMA_BD` | - | Nombre del esquema de la base de datos |
+| `SECRET_KEY_JWT` | `super-secret-key-aca-debe-ir` | Clave para firmar JWT (⚠️ cambiar en producción) |
+| `EXPIRES_TOKEN_IN_SECONDS` | 300 | Tiempo de expiración del token de acceso en segundos |
+| `CONTEXT_PATH` | `/oauth` | Ruta base para endpoints OAuth |
 
-### CORS Configuration
+### Configuración CORS
 
-The API allows requests from the following origins:
+La API permite solicitudes desde los siguientes orígenes:
 - `https://dev.jonnattan.com`
 - `https://api.jonnattan.cl`
 - `https://www.jonna.cl`
@@ -413,112 +424,109 @@ The API allows requests from the following origins:
 - `https://docs.jonna.cl`
 - `https://docs.jonnattan.cl`
 
-To modify, edit the `cors = CORS(...)` line in `app/server.py`.
+Para modificar, edita la línea `cors = CORS(...)` en `app/server.py`.
 
-## Security Considerations
+## Consideraciones de Seguridad
 
-### Password Security
-- Passwords are hashed using **bcrypt** via werkzeug's `generate_password_hash()`
-- Plain-text passwords are never stored in the database
-- Implement password strength requirements in your client application
+### Seguridad de Contraseñas
+- Las contraseñas se cifran con **bcrypt** vía `generate_password_hash()` de werkzeug
+- Las contraseñas en texto plano nunca se almacenan en la base de datos
+- Implementa requisitos de fortaleza de contraseña en tu aplicación cliente
 
-### JWT Security
-- Tokens are signed with a secret key (`SECRET_KEY_JWT`)
-- **⚠️ Change the default secret key in production**
-- Access tokens have configurable TTL (default: 300 seconds / 5 minutes)
-- Refresh tokens have longer validity and are stored in the database for revocation tracking
-- Tokens are invalidated when users log out
+### Seguridad JWT
+- Los tokens se firman con una clave secreta (`SECRET_KEY_JWT`)
+- **⚠️ Cambia la clave secreta por defecto en producción**
+- Los tokens de acceso tienen TTL configurable (por defecto: 300 segundos / 5 minutos)
+- Los refresh tokens tienen mayor validez y se almacenan en BD para seguimiento de revocación
+- Los tokens se invalidan cuando los usuarios cierran sesión
 
-### API Key Management
-- API keys are stored in the `clients` table
-- Each client company has one API key
-- API keys are required for `/login` and `/validate` endpoints
-- Implement key rotation policies
+### Gestión de API Keys
+- Las claves API se almacenan en la tabla `clients`
+- Cada cliente tiene una clave API única
+- Las claves API son requeridas para los endpoints `/login` y `/validate`
+- Implementa políticas de rotación de claves
 
-### Best Practices
+### Mejores Prácticas
 
-1. **Use HTTPS in production** - Tokens are sensitive and must be transmitted securely
-2. **Short access token TTL** - Use short expiration times and refresh tokens for longer sessions
-3. **Secure secret storage** - Use environment variables or secrets management system for `SECRET_KEY_JWT`
-4. **Database security** - Limit database access, use strong credentials, enable SSL/TLS for DB connections
-5. **Rate limiting** - Implement rate limiting on login endpoint to prevent brute-force attacks
-6. **Logging** - Monitor authentication logs for suspicious activity
+1. **Usa HTTPS en producción** - Los tokens son sensibles y deben transmitirse de forma segura
+2. **TTL corto para tokens de acceso** - Usa tiempos de expiración cortos y refresh tokens para sesiones más largas
+3. **Almacenamiento seguro de secretos** - Usa variables de entorno o sistemas de gestión de secretos para `SECRET_KEY_JWT`
+4. **Seguridad de la base de datos** - Limita el acceso, usa credenciales fuertes, habilita SSL/TLS para conexiones BD
+5. **Rate limiting** - Implementa límite de tasas en el endpoint `/login` para prevenir ataques de fuerza bruta
+6. **Logging** - Monitorea logs de autenticación para actividad sospechosa
 
-## Development
+## Desarrollo
 
-### Project Structure
+### Estructura del Proyecto
 
 ```
 sec-api/
 ├── app/
-│   ├── server.py          # Main Flask application and OAuth endpoints
-│   ├── security.py        # Authentication and token management logic
-│   ├── checker.py         # Health check utilities
-│   ├── coordinator.py     # External integrations (not OAuth-related)
-│   └── utils.py           # Helper utilities
-├── requirements.txt       # Python dependencies
-├── Dockerfile            # Container image definition
-├── docker-compose.yml    # Docker Compose configuration
-├── CLAUDE.md             # Claude Code guidance
-└── README.md             # This file
+│   ├── server.py          # Aplicación Flask principal y endpoints OAuth
+│   └── security.py        # Lógica de autenticación y gestión de tokens
+├── requirements.txt       # Dependencias de Python
+├── Dockerfile            # Definición de imagen del contenedor
+├── docker-compose.yml    # Configuración de Docker Compose
+├── CLAUDE.md             # Guía para Claude Code
+└── README.md             # Este archivo
 ```
 
-### Running Tests
+### Pruebas Locales
 
-Create a test client in the `clients` table:
+Crea un cliente de prueba en la tabla `clients`:
 
 ```sql
-INSERT INTO clients (company, apikey) VALUES ('Test Company', 'test_api_key_123');
+INSERT INTO clients (company, apikey) VALUES ('Empresa de Prueba', 'clave_api_prueba_123');
 ```
 
-Create a test user in the `oauth` table:
+Crea un usuario de prueba en la tabla `oauth`:
 
 ```sql
 INSERT INTO oauth (username, password, role) 
-VALUES ('testuser', '...bcrypt_hash...', 'user');
+VALUES ('usuario_prueba', '...hash_bcrypt...', 'user');
 ```
 
-Use the provided cURL or Python examples to test the endpoints.
+Usa los ejemplos de cURL o Python proporcionados para probar los endpoints.
 
 ### Logging
 
-The application logs all authentication events to stdout with format:
+La aplicación registra todos los eventos de autenticación en stdout con formato:
 ```
-2026-04-18 15:30:00,123 INFO : Cliente: Acme Corp
+2026-04-19 10:30:00,123 INFO : Cliente: Mi Empresa
 ```
 
-View logs in Docker:
+Ver logs en Docker:
 ```bash
 docker-compose logs -f test-api
 ```
 
-## Troubleshooting
+## Solución de Problemas
 
-### Database Connection Issues
-- Verify MySQL is running and accessible
-- Check environment variables (`HOST_BD`, `PORT_BD`, `USER_BD`, `PASS_BD`, `SCHEMA_BD`)
-- Ensure the database schema exists and tables are created
+### Problemas de Conexión a Base de Datos
+- Verifica que MySQL esté ejecutándose y sea accesible
+- Verifica variables de entorno (`HOST_BD`, `PORT_BD`, `USER_BD`, `PASS_BD`, `SCHEMA_BD`)
+- Asegúrate de que el esquema de la base de datos exista y las tablas estén creadas
 
-### Authentication Failures
-- Verify API key exists in `clients` table and is correct
-- Ensure user exists in `oauth` table with status='ACTIVE'
-- Confirm password hash is valid (use bcrypt when creating test users)
+### Fallos de Autenticación
+- Verifica que la API key exista en la tabla `clients` y sea correcta
+- Asegúrate de que el usuario exista en la tabla `oauth` con `status='ACTIVE'`
+- Confirma que el hash de la contraseña sea válido (usa bcrypt para crear usuarios de prueba)
 
-### Token Validation Fails
-- Ensure token exists in `user_jwt` table with status='ACTIVE'
-- Verify token hasn't expired (`create_at + EXPIRES_TOKEN_IN_SECONDS`)
-- Check that the token wasn't revoked by logout
+### Validación de Token Falla
+- Asegúrate de que el token existe en la tabla `user_jwt` con `status='ACTIVE'`
+- Verifica que el token no haya expirado (`create_at + EXPIRES_TOKEN_IN_SECONDS`)
+- Comprueba que el token no fue revocado por logout
 
-### Port Already in Use
-Change the port when running locally:
+### Puerto Already in Use (Ya en Uso)
+Cambia el puerto al ejecutar localmente:
 ```bash
 python app/server.py 8080
 ```
 
-## Support
+## Soporte
 
-For issues, questions, or contributions, please open an issue in the repository.
+Para problemas, preguntas o contribuciones, abre un issue en el repositorio.
 
-## License
+## Licencia
 
-[Add your license information here]
+[Añade tu información de licencia aquí]

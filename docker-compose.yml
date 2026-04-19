@@ -12,6 +12,6 @@ services:
         - ../envs/security.env
       networks:
         - db-net
-      command: tail -f /home/jonnattan/requirements.txt
+      #command: tail -f /home/jonnattan/requirements.txt
 networks:
   db-net:

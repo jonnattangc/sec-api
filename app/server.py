@@ -5,23 +5,12 @@ try:
     import sys
     import os
     import time
-    import requests
-    import json
-    from datetime import datetime, timedelta
-    import ssl
-    from flask_cors import CORS
-    from flask_wtf.csrf import CSRFProtect
-    
     from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt, decode_token
-
-    from flask_login import LoginManager, UserMixin, current_user, login_required, login_user
-    from flask import Flask, render_template, abort, make_response, request, redirect, jsonify, send_from_directory
+    from flask import Flask, request, jsonify
     from werkzeug.middleware.proxy_fix import ProxyFix
-    from flask_swagger_ui import get_swaggerui_blueprint
     from flasgger import Swagger
+    from flask_cors import CORS
     from security import Security
-    from checker import Checker
-    from coordinator import Coordinator
 
 except ImportError:
 
@@ -47,38 +36,143 @@ logger = logging.getLogger('HTTP')
 # ===============================================================================
 ROOT_DIR = os.path.dirname(__file__)
 
-SECRET_CSRF : str = os.environ.get('SECRET_KEY_CSRF','super-secret-key-aca-debe-ir')
 EXPIRES_IN_SECONDS : int = int(os.environ.get('EXPIRES_TOKEN_IN_SECONDS', 300 ))
 SECRET_JWT : str = os.environ.get('SECRET_KEY_JWT','super-secret-key-aca-debe-ir')
 
+CONTEXT_PATH : str = os.environ.get('CONTEXT_PATH','/oauth')
 
 app = Flask(__name__)
-
-app.config.update( DEBUG=False, SECRET_KEY = str(SECRET_CSRF), )
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
 
 template = {
     "openapi": "3.0.1",
     "info": {
-        "title": "API Documentación",
-        "description": "Documentación de mi API con modelos compartidos",
-        "version": "1.0.0"
+        "title": "API de Seguridad OAuth2/JWT",
+        "description": "Servidor de autenticación centralizado con JWT para servicios internos",
+        "version": "1.0.0",
+        "contact": {
+            "name": "Soporte",
+            "email": "jonnattan@gmail.com"
+        }
     },
+    "servers": [
+        {
+            "url": "http://localhost:8079",
+            "description": "Servidor local de desarrollo"
+        }
+    ],
     "components": {
         "schemas": {
-            "MiModelo": {  # <--- AQUÍ DEFINES EL MODELO QUE TE DABA ERROR
+            "LoginRequest": {
+                "type": "object",
+                "required": ["username", "password"],
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "example": "usuario"
+                    },
+                    "password": {
+                        "type": "string",
+                        "example": "contraseña_segura"
+                    }
+                }
+            },
+            "User": {
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "integer",
                         "example": 1
                     },
-                    "nombre": {
+                    "username": {
                         "type": "string",
-                        "example": "Juan Perez"
+                        "example": "usuario"
+                    },
+                    "role": {
+                        "type": "string",
+                        "example": "user"
+                    },
+                    "status": {
+                        "type": "string",
+                        "example": "ACTIVE"
+                    },
+                    "last_login": {
+                        "type": "string",
+                        "format": "date-time",
+                        "example": "2026-04-19T10:30:00"
                     }
                 }
+            },
+            "Client": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "example": 1
+                    },
+                    "company": {
+                        "type": "string",
+                        "example": "Mi Empresa"
+                    },
+                    "status": {
+                        "type": "string",
+                        "example": "ACTIVE"
+                    }
+                }
+            },
+            "LoginResponse": {
+                "type": "object",
+                "properties": {
+                    "access_token": {
+                        "type": "string",
+                        "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    },
+                    "refresh_token": {
+                        "type": "string",
+                        "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    },
+                    "expires_in": {
+                        "type": "integer",
+                        "example": 300
+                    },
+                    "user": {
+                        "$ref": "#/components/schemas/User"
+                    },
+                    "client": {
+                        "$ref": "#/components/schemas/Client"
+                    }
+                }
+            },
+            "MessageResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "example": "OK"
+                    }
+                }
+            },
+            "ErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "example": "No autorizado"
+                    }
+                }
+            }
+        },
+        "securitySchemes": {
+            "BearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT"
+            },
+            "ApiKeyAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "x-api-key"
             }
         }
     }
@@ -87,29 +181,26 @@ template = {
 
 
 app.config['SWAGGER'] = {
-    'title': 'API Documentación',
+    'title': 'API de Seguridad OAuth2/JWT',
     'uiversion': 3,
-    'openapi': '3.0.1', # Forzar versión moderna de OpenAPI
+    'openapi': '3.0.1',
     'specs_route': '/apidocs/',
     'doc_dir': str(ROOT_DIR) + '/docs',
     'static_url_path': '/flasgger_static',
     'specs': [
         {
-            "endpoint": 'apijonna',
-            "route": '/apijonna.json',
+            "endpoint": 'api_oauth',
+            "route": '/api_oauth.json',
             "rule_filter": lambda rule: True,
             "model_filter": lambda tag: True,
         }
     ],
     "headers": [],
-    "schemes": ["https"], 
+    "schemes": ["https", "http"],
     "static_lib_url": "https://unpkg.com/swagger-ui-dist@3/"
 }
 
 swagger = Swagger(app, template=template)
-
-csrf = CSRFProtect()
-csrf.init_app(app)
 
 # JWT Manager Config
 app.config["JWT_SECRET_KEY"] = SECRET_JWT
@@ -118,9 +209,101 @@ jwt = JWTManager(app)
 
 cors = CORS(app, origins=["https://dev.jonnattan.com", "https://api.jonnattan.cl","https://www.jonna.cl","https://www.jonnattan.cl","https://api.jonna.cl","https://docs.jonna.cl","https://docs.jonnattan.cl"])
 
-@app.post("/login")
-@csrf.exempt
+
+@app.get(f"{CONTEXT_PATH}/validate")
+@jwt_required()
+def validate():
+    """
+    Validar Token JWT
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+    responses:
+      200:
+        description: Token válido
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageResponse'
+      401:
+        description: Token inválido o no autorizado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
+    data_json = {"message": "Validación fallida"}
+    http_status = 401
+    sec = Security()
+    client = sec.get_client(request.headers.get('x-api-key'))
+    if client != None :
+        logger.info(f"Cliente[{client['id']}]: {client['company']}")
+        data_json = {"message": "OK"}
+        http_status = 200
+        jwt = get_jwt()
+        current_user = get_jwt_identity()
+        user = sec.user_exists(current_user)
+        if jwt == None or str(jwt["client"]) != str(client["id"]) :
+            logger.warn(f"Cliente JWT: {jwt["client"]}")
+            data_json = {"message": "Cliente y/o usuario no autorizado"}
+            http_status = 401
+        # verificar el rol del usuario por si fue modificado en el front
+        if user == None or str(jwt["role"]).lower() != str(user["role"]).lower() :
+            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            data_json = {"message": "Rol o usuario no autorizado"}
+            http_status = 401
+        # verifico si el token es valido, es decir no se ha caducado por otro lado
+        if sec.is_token_valid( jwt ) == False :
+            data_json = {"message": "Token no autorizado"}
+            http_status = 401
+    del sec
+    return jsonify(data_json), http_status
+
+
+@app.post(f"{CONTEXT_PATH}/login")
 def login():
+    """
+    Iniciar Sesión - Obtener Tokens JWT
+    ---
+    tags:
+      - Autenticación
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LoginRequest'
+    responses:
+      200:
+        description: Autenticación exitosa
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginResponse'
+      401:
+        description: Credenciales inválidas o cliente no autorizado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
@@ -129,38 +312,89 @@ def login():
         password = request.json.get("password", None)
         user = sec.verify_credentials(username, password)
         del sec
-        return process_response_jwt( user )
+        return process_response_jwt( user, client )
     del sec
-    return jsonify({ "code": 5000, "message": "No autorizado"}), 401
+    return jsonify({"message": "No autorizado"}), 401
 
-@app.post("/refresh")
-@csrf.exempt
+@app.get(f"{CONTEXT_PATH}/refresh")
 @jwt_required(refresh=True)
 def refresh():
-    user_name = get_jwt_identity()
+    """
+    Refrescar Token de Acceso
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+      - in: header
+        name: Authorization
+        required: true
+        schema:
+          type: string
+        description: Refresh token en formato "Bearer {token}"
+    responses:
+      200:
+        description: Token refrescado exitosamente
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginResponse'
+      401:
+        description: Refresh token inválido o expirado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     sec = Security()
-    user = sec.user_exists(user_name)
-    valid_token = sec.is_refresh_token_valid( get_jwt() )
+    client = sec.get_client( request.headers.get('x-api-key') )
+    if client != None :
+        logger.info(f"Cliente[{client['id']}]: {client['company']}")
+        user_name = get_jwt_identity()
+        user = sec.user_exists(user_name)
+        jwt = get_jwt()
+        logger.info(f"JWT REFRESH: {jwt}")
+        if jwt == None or str(jwt["client"]) != str(client["id"]) :
+            logger.warn(f"Cliente JWT: {jwt['client']}")
+            data_json = {"message": "Cliente y/o usuario no autorizado"}
+            http_status = 401
+        # verificar el rol del usuario por si fue modificado en el front
+        if user == None or jwt == None or str(jwt["role"]).lower() != str(user["role"]).lower()  :
+            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            return jsonify({"message": "Rol o usuario no autorizado para el refresh"}), 401
+        valid_token = sec.is_refresh_token_valid( jwt )
+        if valid_token == False :
+            return jsonify({"message": "Invalid Refresh Token"}), 401
+        return process_response_jwt( user, client )
     del sec
-    if valid_token == False :
-        return jsonify({ "code": 5000, "message": "Token Invalido"}), 401
-    return process_response_jwt( user )
+    return jsonify({"message": "No autorizado"}), 401
 
-def process_response_jwt( user : dict) :
+def process_response_jwt( user : dict, client : dict = None ) :
     if user == None :
-        return jsonify({
-            "code": 5000,
-            "message": f"usuario inválido"
-        }), 401
-
+        return jsonify({"message": f"usuario inválido"}), 401
+    try :
+        del user["password"]
+    except :
+        pass
+    try :
+        del client["mail_pass"]
+    except :
+        pass
     claims : dict = {
-        "last_login"    : user["last_login"],
-        "role"          : str(user["role"]).lower(),
+        "client" : str(client["id"]),
+        "role"   : str(user["role"]).lower()
     }
     username : str = str(user["username"])
     access_token : str = create_access_token(identity=username, additional_claims=claims)
     token_data : dict = decode_token(access_token)
-    refresh_token : str = create_refresh_token(identity=username)
+    refresh_token : str = create_refresh_token(identity=username, additional_claims=claims)
     refresh_token_id : str = decode_token(refresh_token)["jti"]
     sec = Security()
     sec.save_token(username, token_data, refresh_token_id, access_token)
@@ -169,44 +403,67 @@ def process_response_jwt( user : dict) :
         "access_token"  : access_token,
         "refresh_token" : refresh_token,
         "expires_in"    : EXPIRES_IN_SECONDS,
-        "token_type"    : "Bearer"
+        "user"          : user,
+        "client"        : client
     }
     
     return jsonify(response), 200
 
 @jwt.expired_token_loader
 def expired_callback(jwt_header, jwt_payload):
-    return jsonify({
-        "code": 5000,
-        "message": "Tu sesión ha expirado"
-    }), 401
+    return jsonify({"message": "Tu sesión ha expirado"}), 401
 
 @jwt.invalid_token_loader
 def invalid_token_callback(error):
-    return jsonify({
-        "code": 5003,
-        "message": "El token de seguridad no es válido. Acceso denegado."
-    }), 401
+    logger.error(error)
+    return jsonify({"message": "El token de seguridad no es válido. Acceso denegado."}), 401
 
 @jwt.unauthorized_loader
 def unauthorized_callback(error):
-    return jsonify({
-        "code": 5004,
-        "message": "No se encontró un token de acceso. Debes iniciar sesión."
-    }), 401
+    return jsonify({"message": "No se encontró un token de acceso. Debes iniciar sesión."}), 401
 
-@app.delete("/logout")
+@app.delete(f"{CONTEXT_PATH}/logout")
 @jwt_required()
-@csrf.exempt
 def logout():
+    """
+    Cerrar Sesión - Revocar Token
+    ---
+    tags:
+      - Autenticación
+    security:
+      - BearerAuth: []
+    parameters:
+      - in: header
+        name: x-api-key
+        required: true
+        schema:
+          type: string
+        description: Clave API del cliente
+      - in: header
+        name: Authorization
+        required: true
+        schema:
+          type: string
+        description: Token de acceso en formato "Bearer {token}"
+    responses:
+      200:
+        description: Sesión cerrada exitosamente
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageResponse'
+      401:
+        description: Token no válido o no proporcionado
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'
+    """
     jti = get_jwt()["jti"]
     sec = Security()
     sec.delete_token(jti)
     del sec
-    return jsonify({
-        "code": 5010,
-        "message": "Sesión cerrada con exito"
-    }), 200
+    return jsonify({"message": "Sesión cerrada con exito"}), 200
 
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload: dict):
@@ -215,46 +472,6 @@ def check_if_token_revoked(jwt_header, jwt_payload: dict):
     logger.info(f"Token revoked: {status}")
     del sec
     return status
-
-#===============================================================================
-# Se checkea el estado del servidor completo para reportar
-#===============================================================================
-@app.get('/checkall')
-@jwt_required()
-@csrf.exempt
-def checkProccess():
-    """
-    Checkea estado completo del sistema, incluyendo la configuración de la base de datos
-    ---
-    security:
-      - Basic Security: []
-    responses:
-      200:
-        description: Todos los sistemas funcionan correctamente
-      401:
-        description: No autorizado, este metodo se encutra protegido por una autenticación básica
-    """
-
-    jwt = get_jwt()
-    if jwt == None  or jwt["role"] != "query" :
-        return jsonify({"message": "Rol no autorizado"}), 401
-    sec = Security()
-    if sec.is_token_valid( jwt ) == False :
-        return jsonify({"message": "Token no autorizado"}), 401
-    current_user = get_jwt_identity()
-    if current_user == None :
-        return jsonify({"message": "Usuario no encontrado"}), 401
-    user = sec.user_exists(current_user)
-    if user == None :
-        return jsonify({"message": "Usuario no autorizado"}), 401
-    del sec
-
-    checker = Checker()
-    json = checker.get_info()
-    del checker
-    return jsonify(json)
-
-
 
 # ===============================================================================
 # Metodo Principal que levanta el servidor

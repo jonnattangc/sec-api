@@ -5,6 +5,7 @@ try:
     import sys
     import os
     import time
+    from datetime import datetime, timedelta
     from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt, decode_token
     from flask import Flask, request, jsonify
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -205,6 +206,8 @@ swagger = Swagger(app, template=template)
 # JWT Manager Config
 app.config["JWT_SECRET_KEY"] = SECRET_JWT
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = EXPIRES_IN_SECONDS
+# app.config["JWT_REFRESH_TOKEN_EXPIRES"] = (EXPIRES_IN_SECONDS + EXPIRES_IN_SECONDS)
+
 jwt = JWTManager(app)
 
 cors = CORS(app, origins=["https://dev.jonnattan.com", "https://api.jonnattan.cl","https://www.jonna.cl","https://www.jonnattan.cl","https://api.jonna.cl","https://docs.jonna.cl","https://docs.jonnattan.cl"])
@@ -245,14 +248,29 @@ def validate():
     data_json = {"message": "Validación fallida"}
     http_status = 401
     sec = Security()
-    client = sec.get_client(request.headers.get('x-api-key'))
-    if client != None :
+    x_api_key : str = request.headers.get('x-api-key', None )
+    client = sec.get_client(x_api_key)
+    if client == None :
+        logger.error(f"No se encuentra el cliente con la clave API: {x_api_key}")
+    else :
         logger.info(f"Cliente[{client['id']}]: {client['company']}")
-        data_json = {"message": "OK"}
         http_status = 200
         jwt = get_jwt()
         current_user = get_jwt_identity()
         user = sec.user_exists(current_user)
+        
+        try :
+            del user["password"]
+        except :
+            pass
+        try :
+            del client["mail_pass"]
+        except :
+            pass
+
+        data_json = {"message": "OK", "client": client, "user": user}
+
+        # verificar el cliente por si fue modificado en el front
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
             logger.warn(f"Cliente JWT: {jwt["client"]}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
@@ -264,6 +282,7 @@ def validate():
             http_status = 401
         # verifico si el token es valido, es decir no se ha caducado por otro lado
         if sec.is_token_valid( jwt ) == False :
+            logger.warn(f"Token JWT No Valido: {jwt}")
             data_json = {"message": "Token no autorizado"}
             http_status = 401
     del sec
@@ -360,7 +379,7 @@ def refresh():
         user_name = get_jwt_identity()
         user = sec.user_exists(user_name)
         jwt = get_jwt()
-        logger.info(f"JWT REFRESH: {jwt}")
+        logger.info(f"Refresh token: {jwt}")
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
             logger.warn(f"Cliente JWT: {jwt['client']}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
@@ -402,7 +421,6 @@ def process_response_jwt( user : dict, client : dict = None ) :
     response = {
         "access_token"  : access_token,
         "refresh_token" : refresh_token,
-        "expires_in"    : EXPIRES_IN_SECONDS,
         "user"          : user,
         "client"        : client
     }
@@ -411,11 +429,12 @@ def process_response_jwt( user : dict, client : dict = None ) :
 
 @jwt.expired_token_loader
 def expired_callback(jwt_header, jwt_payload):
+    logger.error(f"Token expirado JTI: {jwt_payload['jti']}")
     return jsonify({"message": "Tu sesión ha expirado"}), 401
 
 @jwt.invalid_token_loader
 def invalid_token_callback(error):
-    logger.error(error)
+    logger.error(f"Token invalido: {error}")
     return jsonify({"message": "El token de seguridad no es válido. Acceso denegado."}), 401
 
 @jwt.unauthorized_loader

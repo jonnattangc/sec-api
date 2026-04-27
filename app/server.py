@@ -5,6 +5,7 @@ try:
     import sys
     import os
     import time
+    from datetime import datetime, timedelta
     from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, get_jwt, decode_token
     from flask import Flask, request, jsonify
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -205,6 +206,7 @@ swagger = Swagger(app, template=template)
 # JWT Manager Config
 app.config["JWT_SECRET_KEY"] = SECRET_JWT
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = EXPIRES_IN_SECONDS
+
 jwt = JWTManager(app)
 
 cors = CORS(app, origins=["https://dev.jonnattan.com", "https://api.jonnattan.cl","https://www.jonna.cl","https://www.jonnattan.cl","https://api.jonna.cl","https://docs.jonna.cl","https://docs.jonnattan.cl"])
@@ -242,17 +244,33 @@ def validate():
             schema:
               $ref: '#/components/schemas/ErrorResponse'
     """
+    logger.info(f"INIT: {CONTEXT_PATH}/validate... ")
     data_json = {"message": "Validación fallida"}
     http_status = 401
     sec = Security()
-    client = sec.get_client(request.headers.get('x-api-key'))
-    if client != None :
+    x_api_key : str = request.headers.get('x-api-key', None )
+    client = sec.get_client(x_api_key)
+    if client == None :
+        logger.error(f"No se encuentra el cliente con la clave API: {x_api_key}")
+    else :
         logger.info(f"Cliente[{client['id']}]: {client['company']}")
-        data_json = {"message": "OK"}
         http_status = 200
         jwt = get_jwt()
         current_user = get_jwt_identity()
         user = sec.user_exists(current_user)
+        
+        try :
+            del user["password"]
+        except :
+            pass
+        try :
+            del client["mail_pass"]
+        except :
+            pass
+
+        data_json = {"message": "OK", "client": client, "user": user}
+
+        # verificar el cliente por si fue modificado en el front
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
             logger.warn(f"Cliente JWT: {jwt["client"]}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
@@ -264,6 +282,7 @@ def validate():
             http_status = 401
         # verifico si el token es valido, es decir no se ha caducado por otro lado
         if sec.is_token_valid( jwt ) == False :
+            logger.warn(f"Token JWT No Valido: {jwt}")
             data_json = {"message": "Token no autorizado"}
             http_status = 401
     del sec
@@ -304,6 +323,7 @@ def login():
             schema:
               $ref: '#/components/schemas/ErrorResponse'
     """
+    logger.info(f"INIT: {CONTEXT_PATH}/login... ")
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
@@ -353,6 +373,7 @@ def refresh():
             schema:
               $ref: '#/components/schemas/ErrorResponse'
     """
+    logger.info(f"INIT: {CONTEXT_PATH}/Refresh... ")
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
@@ -360,7 +381,6 @@ def refresh():
         user_name = get_jwt_identity()
         user = sec.user_exists(user_name)
         jwt = get_jwt()
-        logger.info(f"JWT REFRESH: {jwt}")
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
             logger.warn(f"Cliente JWT: {jwt['client']}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
@@ -369,7 +389,7 @@ def refresh():
         if user == None or jwt == None or str(jwt["role"]).lower() != str(user["role"]).lower()  :
             logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
             return jsonify({"message": "Rol o usuario no autorizado para el refresh"}), 401
-        valid_token = sec.is_refresh_token_valid( jwt )
+        valid_token = sec.is_refresh_token_valid(jwt)
         if valid_token == False :
             return jsonify({"message": "Invalid Refresh Token"}), 401
         return process_response_jwt( user, client )
@@ -402,7 +422,6 @@ def process_response_jwt( user : dict, client : dict = None ) :
     response = {
         "access_token"  : access_token,
         "refresh_token" : refresh_token,
-        "expires_in"    : EXPIRES_IN_SECONDS,
         "user"          : user,
         "client"        : client
     }
@@ -411,15 +430,17 @@ def process_response_jwt( user : dict, client : dict = None ) :
 
 @jwt.expired_token_loader
 def expired_callback(jwt_header, jwt_payload):
+    logger.error(f"Token jwt {jwt_payload['jti']} expirado...")
     return jsonify({"message": "Tu sesión ha expirado"}), 401
 
 @jwt.invalid_token_loader
 def invalid_token_callback(error):
-    logger.error(error)
+    logger.error(f"Token invalido: {error}")
     return jsonify({"message": "El token de seguridad no es válido. Acceso denegado."}), 401
 
 @jwt.unauthorized_loader
 def unauthorized_callback(error):
+    logger.error(f"Token no encontrado: {error}")
     return jsonify({"message": "No se encontró un token de acceso. Debes iniciar sesión."}), 401
 
 @app.delete(f"{CONTEXT_PATH}/logout")
@@ -459,6 +480,7 @@ def logout():
             schema:
               $ref: '#/components/schemas/ErrorResponse'
     """
+    logger.info(f"INIT: {CONTEXT_PATH}/logout... ")
     jti = get_jwt()["jti"]
     sec = Security()
     sec.delete_token(jti)

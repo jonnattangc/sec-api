@@ -133,11 +133,11 @@ class Security() :
                 cursor.execute(sql, (id_token,))
                 user = cursor.fetchone()
                 if user != None :
-                    logging.info(f"Actualizo token: {user['id']}")
+                    logging.info(f"Actualizo token: {user['id']} de usuario: {user['user']}")
                     sql = """UPDATE user_jwt SET create_at = %s, token = %s, refresh_id = %s WHERE id = %s"""
                     cursor.execute(sql, (date_str, token_jwt, refresh_token_id,id_token,))
                 else :
-                    logging.info(f"Guardo último token creado: {id_token} refresh: {refresh_token_id}")
+                    logging.info(f"Guardo último token {id_token} y refresh: {refresh_token_id} generados")
                     self.delete_tokens(username)
                     sql = """INSERT INTO user_jwt (id, create_at, user, status, token, refresh_id) VALUES(%s, %s, %s, %s, %s, %s)"""
                     cursor.execute(sql, (id_token, date_str, username, 'ACTIVE', token_jwt, refresh_token_id))
@@ -152,6 +152,7 @@ class Security() :
             if self.db != None :
                 cursor = self.db.cursor()
                 sql = """delete from user_jwt where user = %s"""
+                logging.info(f"Elimino tokens de usuario: {username}")
                 cursor.execute(sql, (username,))
                 self.db.commit()
         except Exception as e:
@@ -165,18 +166,19 @@ class Security() :
                 cursor = self.db.cursor()
                 sql = """delete from user_jwt where id = %s"""
                 cursor.execute(sql, (id_token,))
+                logging.info(f"Elimino token id: {id_token}")
                 self.db.commit()
         except Exception as e:
             print("ERROR delete_token(): ", e)
             self.db.rollback()
 
     def is_token_valid(self, token: dict) -> bool :
-        logging.info(f"Verifico validez de token: {token['jti']}" )
+        logging.info(f"Verifico validez de token jwt: {token['jti']}" )
         valid : bool = False
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from user_jwt where id = %s and status = %s order by create_at desc"""
+                sql = """select * from user_jwt where id = %s and status = %s"""
                 cursor.execute(sql, (token['jti'], 'ACTIVE'))
                 results = cursor.fetchall()
                 valid = len(results) > 0
@@ -191,12 +193,12 @@ class Security() :
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from user_jwt where refresh_id = %s and status = %s order by create_at desc"""
+                sql = """select * from user_jwt where refresh_id = %s and status = %s"""
                 cursor.execute(sql, (token['jti'], 'ACTIVE'))
                 results = cursor.fetchall()
                 valid = len(results) > 0
         except Exception as e:
-            print("ERROR BD is_token_valid():", e)
+            print("ERROR BD is_refresh_token_valid():", e)
             valid = False
         return valid
 
@@ -206,11 +208,11 @@ class Security() :
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from user_jwt where id = %s and status <> %s order by create_at desc"""
+                sql = """select * from user_jwt where id = %s and status <> %s"""
                 cursor.execute(sql, (token['jti'], 'ACTIVE'))
                 results = cursor.fetchall()
                 valid = len(results) > 0
         except Exception as e:
-            print("ERROR BD is_token_valid():", e)
+            print("ERROR BD is_token_revoked():", e)
             valid = False
         return valid

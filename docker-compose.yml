@@ -1,14 +1,13 @@
 services:
     test-api:
       container_name: security-api
-      image: jonnattangc/security:1.0.0
-      #build: 
-      #  dockerfile: Dockerfile
+      image: jonnattangc/secure:1.0.3
+      build: .
       restart: always
       volumes:
         - ./app:/home/jonnattan/app
       ports:
-        - "8080:8080"
+        - "8079:8080"
       env_file:
         - ../envs/security.env
       networks:

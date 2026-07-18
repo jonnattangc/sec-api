@@ -1,0 +1,7 @@
+# ignores files
+.clauderc
+CLAUDE.md
+docker-compose.yml
+Dockerfile
+README.md
+.gitignore

@@ -42,6 +42,9 @@ SECRET_JWT : str = os.environ.get('SECRET_KEY_JWT','super-secret-key-aca-debe-ir
 
 CONTEXT_PATH : str = os.environ.get('CONTEXT_PATH','/oauth')
 
+DEFAULT_CORS_ORIGINS = "https://dev.jonnattan.com,https://api.jonnatech.cl,https://www.jonnatech.cl,https://api.jonnattan.cl,https://www.jonna.cl,https://www.jonnattan.cl,https://api.jonna.cl,https://docs.jonna.cl,https://docs.jonnattan.cl"
+CORS_ORIGINS : list = [origin.strip() for origin in os.environ.get('CORS_ORIGINS', DEFAULT_CORS_ORIGINS).split(',') if origin.strip()]
+
 app = Flask(__name__)
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
@@ -112,7 +115,7 @@ template = {
                         "type": "integer",
                         "example": 1
                     },
-                    "company": {
+                    "name_company": {
                         "type": "string",
                         "example": "Mi Empresa"
                     },
@@ -209,7 +212,7 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = EXPIRES_IN_SECONDS
 
 jwt = JWTManager(app)
 
-cors = CORS(app, origins=["https://dev.jonnattan.com", "https://api.jonnattan.cl","https://www.jonna.cl","https://www.jonnattan.cl","https://api.jonna.cl","https://docs.jonna.cl","https://docs.jonnattan.cl"])
+cors = CORS(app, origins=CORS_ORIGINS)
 
 
 @app.get(f"{CONTEXT_PATH}/validate")
@@ -253,11 +256,11 @@ def validate():
     if client == None :
         logger.error(f"No se encuentra el cliente con la clave API: {x_api_key}")
     else :
-        logger.info(f"Cliente[{client['id']}]: {client['company']}")
+        logger.info(f"Cliente[{client['id']}]: {client['name_company']}")
         http_status = 200
         jwt = get_jwt()
         current_user = get_jwt_identity()
-        user = sec.user_exists(current_user)
+        user = sec.user_exists(current_user, client["id"])
         
         try :
             del user["password"]
@@ -272,17 +275,17 @@ def validate():
 
         # verificar el cliente por si fue modificado en el front
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
-            logger.warn(f"Cliente JWT: {jwt["client"]}")
+            logger.info(f"Cliente JWT: {jwt["client"]}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
             http_status = 401
         # verificar el rol del usuario por si fue modificado en el front
         if user == None or str(jwt["role"]).lower() != str(user["role"]).lower() :
-            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            logger.info(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
             data_json = {"message": "Rol o usuario no autorizado"}
             http_status = 401
         # verifico si el token es valido, es decir no se ha caducado por otro lado
         if sec.is_token_valid( jwt ) == False :
-            logger.warn(f"Token JWT No Valido: {jwt}")
+            logger.info(f"Token JWT No Valido: {jwt}")
             data_json = {"message": "Token no autorizado"}
             http_status = 401
     del sec
@@ -325,14 +328,16 @@ def login():
     """
     logger.info(f"INIT: {CONTEXT_PATH}/login... ")
     sec = Security()
-    client = sec.get_client( request.headers.get('x-api-key') )
+    client : dict = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
-        logger.info(f"Cliente: {client['company']}")
+        logger.info(f"Cliente[{client['id']}] = {client['name_company']}")
         username = request.json.get("username", None)
         password = request.json.get("password", None)
-        user = sec.verify_credentials(username, password)
+        user = sec.verify_credentials(username, password, client)
         del sec
         return process_response_jwt( user, client )
+    else :
+        logger.error(f"No se encuentra el cliente con la clave API: {request.headers.get('x-api-key')}")
     del sec
     return jsonify({"message": "No autorizado"}), 401
 
@@ -377,17 +382,17 @@ def refresh():
     sec = Security()
     client = sec.get_client( request.headers.get('x-api-key') )
     if client != None :
-        logger.info(f"Cliente[{client['id']}]: {client['company']}")
+        logger.info(f"Cliente[{client['id']}]: {client['name_company']}")
         user_name = get_jwt_identity()
-        user = sec.user_exists(user_name)
+        user = sec.user_exists(user_name, client['id'])
         jwt = get_jwt()
         if jwt == None or str(jwt["client"]) != str(client["id"]) :
-            logger.warn(f"Cliente JWT: {jwt['client']}")
+            logger.info(f"Cliente JWT: {jwt['client']}")
             data_json = {"message": "Cliente y/o usuario no autorizado"}
             http_status = 401
         # verificar el rol del usuario por si fue modificado en el front
         if user == None or jwt == None or str(jwt["role"]).lower() != str(user["role"]).lower()  :
-            logger.warn(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
+            logger.info(f"Rol JWT: {jwt["role"]} y Rol User: {user['role']}")
             return jsonify({"message": "Rol o usuario no autorizado para el refresh"}), 401
         valid_token = sec.is_refresh_token_valid(jwt)
         if valid_token == False :
@@ -403,21 +408,19 @@ def process_response_jwt( user : dict, client : dict = None ) :
         del user["password"]
     except :
         pass
-    try :
-        del client["mail_pass"]
-    except :
-        pass
     claims : dict = {
         "client" : str(client["id"]),
-        "role"   : str(user["role"]).lower()
+        "claims"   : str(user["claims"]).lower(),
+        "role"     : str(user["role"]).lower()
     }
     username : str = str(user["username"])
+    user_id : str = str(user["id"])
     access_token : str = create_access_token(identity=username, additional_claims=claims)
     token_data : dict = decode_token(access_token)
     refresh_token : str = create_refresh_token(identity=username, additional_claims=claims)
     refresh_token_id : str = decode_token(refresh_token)["jti"]
     sec = Security()
-    sec.save_token(username, token_data, refresh_token_id, access_token)
+    sec.save_token(user_id, token_data, refresh_token_id, access_token)
     del sec
     response = {
         "access_token"  : access_token,

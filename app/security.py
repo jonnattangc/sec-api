@@ -25,9 +25,11 @@ class Security() :
             self.db = pymysql.connect(host=host, port=port, 
                 user=user_bd, password=pass_bd, database=eschema, 
                 cursorclass=pymysql.cursors.DictCursor)
+
+            # logging.info(f"Conectado a BD: {host}:{port}/{eschema} con usuario: {user_bd}")
         
         except Exception as e :
-            print("ERROR __init__:", e)
+            print("ERROR __init__: ", e)
             self.db = None
 
     def __del__(self):
@@ -35,12 +37,12 @@ class Security() :
             self.db.close()
 
     def get_client( self, api_key_rx : str ) -> dict :
-        #logging.info(f"Busco cliente: {api_key_rx}")
+        logging.info(f"Busco cliente con ApiKey: {api_key_rx}")
         client : dict = None
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from clients where apikey = %s"""
+                sql = """select * from tenant where apikey = %s"""
                 cursor.execute(sql, (api_key_rx,))
                 results = cursor.fetchall()
                 for row in results:
@@ -50,20 +52,23 @@ class Security() :
             print("ERROR BD:", e)
         return client
 
-    def verify_credentials( self, username, password ) -> dict :
-        logging.info(f"Verifico credeciales para usuario: {username}")
+    def verify_credentials( self, username, password, client = dict ) -> dict :
+        logging.info(f"Verifico credeciales para usuario: {username} y tenant: {client['id']}")
         user : dict = None
         try :
             if username == None or password == None:
                 return user
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from oauth where username = %s and status = %s"""
-                cursor.execute(sql, (username,'ACTIVE'))
+                tenant : str = client['id']
+                sql = """select * from oauth where username = %s and status = %s and tenant_id = %s"""
+                cursor.execute(sql, (username,'ACTIVE', tenant))
                 results = cursor.fetchall()
+                if len(results) == 0 :
+                    logging.info(f"Usuario no encontrado: {username} de tenant: {tenant}")
                 for row in results:
                     user = row
-                    # logging.info(f"Usuario encontrado: {user}")
+                    logging.info(f"Usuario encontrado con ID: {user['id']}")
                     if user != None :
                         bd_pass : str = str(user['password'])
                         db_user : str = str(user['username'])
@@ -106,23 +111,23 @@ class Security() :
             print("ERROR BD:", e)
             self.db.rollback()
 
-    def user_exists(self, username: str) -> dict :
+    def user_exists(self, username: str, tenant: str) -> dict :
         logging.info(f"Verifico existencia de usuario: {username}" )
         user : dict = None
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """select * from oauth where username = %s and status = %s"""
-                cursor.execute(sql, (username,'ACTIVE'))
+                sql = """select * from oauth where username = %s and status = %s and tenant_id = %s"""
+                cursor.execute(sql, (username,'ACTIVE', tenant))
                 results = cursor.fetchall()
                 for row in results:
                     user = row
                     break
         except Exception as e:
-            print("ERROR BD:", e)
+            print("ERROR BD user_exists():", e)
         return user
 
-    def save_token(self, username: str, data_token: dict, refresh_token_id: str, token_jwt: str) :
+    def save_token(self, user_id: str, data_token: dict, refresh_token_id: str, token_jwt: str) :
         try :
             user : dict = None
             id_token : str = data_token['jti']
@@ -134,26 +139,26 @@ class Security() :
                 user = cursor.fetchone()
                 if user != None :
                     logging.info(f"Actualizo token: {user['id']} de usuario: {user['user']}")
-                    sql = """UPDATE user_jwt SET create_at = %s, token = %s, refresh_id = %s WHERE id = %s"""
+                    sql = """UPDATE user_jwt SET update_at = %s, token = %s, refresh_id = %s WHERE id = %s"""
                     cursor.execute(sql, (date_str, token_jwt, refresh_token_id,id_token,))
                 else :
                     logging.info(f"Guardo último token {id_token} y refresh: {refresh_token_id} generados")
-                    self.delete_tokens(username)
-                    sql = """INSERT INTO user_jwt (id, create_at, user, status, token, refresh_id) VALUES(%s, %s, %s, %s, %s, %s)"""
-                    cursor.execute(sql, (id_token, date_str, username, 'ACTIVE', token_jwt, refresh_token_id))
+                    self.delete_tokens(user_id)
+                    sql = """INSERT INTO user_jwt (id, create_at, update_at, user_id, status, token, refresh_id) VALUES(%s, %s, %s, %s, %s, %s, %s)"""
+                    cursor.execute(sql, (id_token, date_str, date_str, user_id, 'ACTIVE', token_jwt, refresh_token_id))
                 self.db.commit()
         except Exception as e:
             print("ERROR save_token(): ", e)
             self.db.rollback()
 
 
-    def delete_tokens(self, username: str) :
+    def delete_tokens(self, user_id: str) :
         try :
             if self.db != None :
                 cursor = self.db.cursor()
-                sql = """delete from user_jwt where user = %s"""
-                logging.info(f"Elimino tokens de usuario: {username}")
-                cursor.execute(sql, (username,))
+                sql = """delete from user_jwt where user_id = %s"""
+                logging.info(f"Elimino tokens de usuario: {user_id}")
+                cursor.execute(sql, (user_id,))
                 self.db.commit()
         except Exception as e:
             print("ERROR delete_tokens(): ", e)

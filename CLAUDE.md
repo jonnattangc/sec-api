@@ -10,13 +10,24 @@ This is a Flask-based OAuth/JWT authentication API (`sec-api`) that serves as a 
 
 ### Core Components
 
-- **server.py**: Main Flask application with OAuth endpoints (`/oauth/login`, `/oauth/refresh`, `/oauth/validate`, `/oauth/logout`). Handles JWT token generation and validation. Uses Flask-JWT-Extended for token management and Flask-CORS for cross-origin requests. Swagger documentation available at `/apidocs/`.
+- **server.py**: Main Flask application with OAuth endpoints (`/oauth/login`, `/oauth/refresh`, `/oauth/validate`, `/oauth/logout`) plus `GET /oauth/health` (liveness/readiness: runs `SELECT 1`, returns 200 `{"status":"UP"}` or 503 when the DB is unreachable). Handles JWT token generation and validation. Uses Flask-JWT-Extended for token management and Flask-CORS for cross-origin requests. Swagger documentation available at `/apidocs/`.
 
 - **security.py**: `Security` class manages all database interactions for authentication:
   - User credential verification via bcrypt password hashing
   - JWT token lifecycle (create, store, revoke, validate)
-  - API key client lookup
+  - System resolution (`get_system` by `saas_system.uuid`), tenant lookup (`get_tenant` by `tenant.uuid`), and active-contract check (`get_active_contract`)
   - Token refresh and revocation tracking
+
+- **admin.py**: `Admin(Security)` class (subclasses Security to reuse the DB connection) provides CRUD for administration and self-service onboarding:
+  - Systems (`saas_system`), tenants (`tenant`), contracts (`tenant_contract`), users (`oauth`)
+  - `register()`: transactional onboarding — creates tenant + DEMO contract + first ADMIN user
+
+- **routes.py**: Two Flask Blueprints plus the auth decorators (`admin_required`, `superadmin_required`):
+  - `admin_bp` (prefix `<CONTEXT_PATH>/admin`, i.e. `/oauth/admin`): protected CRUD endpoints for systems/tenants/contracts/users
+  - `public_bp` (prefix `/oauth`): public onboarding — `GET /oauth/catalog`, `POST /oauth/register`
+  - Roles (`oauth.role`): `SUPERADMIN`, `ADMIN`, `USER`, `QUERY` (`VIEW` was removed)
+  - Super-admin = JWT role **SUPERADMIN** whose `tenant` claim equals env `PLATFORM_TENANT_ID`. Both conditions are required: the role alone would let a tenant-admin escalate by creating a SUPERADMIN inside its own tenant. For the same reason, only a super-admin may assign the SUPERADMIN role (`_check_role_grant`)
+  - `admin_required` accepts ADMIN and SUPERADMIN (super-admin inherits admin); tenant-admin manages only its own tenant's users
 
 - **checker.py**: `Checker` class provides system health checks:
   - Database connectivity validation
@@ -37,16 +48,18 @@ This is a Flask-based OAuth/JWT authentication API (`sec-api`) that serves as a 
 
 ### Database Schema (MySQL)
 
-- `oauth`: User credentials with username, password (hashed), role, status, last_login
-- `clients`: API clients with id, company, apikey, mail credentials
-- `user_jwt`: JWT token tracking with id (jti), user, token, refresh_id, status, create_at
+- `saas_system`: Available SaaS systems with id, name, visible, uuid, status (ENABLED/DISABLED), description, url, `order` (display order), created_at, updated_at. The `uuid` is sent as the `x-api-key` header. Note: `order` is a MySQL reserved word — always quote it with backticks in explicit SQL. Timestamps have no DB default; `admin.py` sets them.
+- `tenant`: Clients with id, name_company, uuid (UNIQUE), razon_social, contacto, mail_contacto. The `uuid` is sent as the `client-id` header.
+- `tenant_contract`: Contract linking a tenant to a system with tenant_id, system_id, status (ACTIVE/INACTIVE/DEMO), finish_at. Gates login/validate/refresh.
+- `oauth`: User credentials with username, password (hashed), role, status, claims, full_name, last_login, tenant_id (FK to tenant)
+- `user_jwt`: JWT token tracking with id (jti), user_id, token, refresh_id, status, create_at
 - `deposits`: Financial transaction records
 
 ### Authentication Flow
 
-1. Client sends credentials + x-api-key header to `/oauth/login`
-2. API key verified against `clients` table
-3. User credentials verified via bcrypt in `oauth` table
+1. Client sends credentials + `x-api-key` (system uuid) + `client-id` (tenant uuid) headers to `/oauth/login`
+2. System resolved from `saas_system` (ENABLED) and tenant from `tenant`; an active `tenant_contract` between them is required
+3. User credentials verified via bcrypt in `oauth` table (scoped by tenant_id)
 4. JWT access token and refresh token generated
 5. Tokens stored in `user_jwt` table
 6. Client receives tokens with expiration (default: 300 seconds, configurable via `EXPIRES_TOKEN_IN_SECONDS`)
@@ -66,7 +79,14 @@ EXPIRES_TOKEN_IN_SECONDS=300        # Access token TTL
 SECRET_KEY_JWT=super-secret-key-aca-debe-ir  # JWT signing key (CHANGE IN PRODUCTION)
 
 # API Configuration
-CONTEXT_PATH=/oauth              # OAuth endpoint prefix
+CONTEXT_PATH=/oauth              # Base prefix for ALL endpoints (admin hangs off it: /oauth/admin)
+PLATFORM_TENANT_ID=              # Platform tenant id; its ADMIN users are super-admins
+
+# Network restriction (see "Restricción por red de origen")
+ALLOWED_NETWORKS=                # Comma-separated CIDRs allowed to call the API. EMPTY = filter OFF
+TRUSTED_PROXY_COUNT=0            # Number of trusted reverse proxies in front of the app
+PUBLIC_PATHS=                    # Comma-separated paths exempt from the filter. EMPTY = none exempt
+DEMO_TRIAL_DAYS=30               # DEMO contract validity (days) created on onboarding
 
 # External Services
 BEARER_MIDDLEWARE=    # Bearer token for middleware notifications
@@ -134,6 +154,33 @@ curl -X DELETE http://localhost:8079/oauth/logout \
 ```
 
 ## Key Implementation Details
+
+### Restricción por red de origen
+
+**Traffic model: this API is backend-to-backend only.** No browser calls it directly — each
+front-end has its own backend, and that backend is the only client of sec-api. Every endpoint,
+including `/oauth/login`, is therefore internal.
+
+`restrict_by_network()` (a `@app.before_request` in server.py) rejects with 403 any request whose
+client IP is outside `ALLOWED_NETWORKS`. Scope:
+
+- **Applies to**: every endpoint, with no exceptions by default.
+- **Exempt**: the health check (`<CONTEXT_PATH>/health`, since kubelet probes come from the node
+  IP), CORS preflight (`OPTIONS`), plus any path listed in `PUBLIC_PATHS` (empty by
+  default — only set it if some endpoint genuinely must be reachable from outside).
+- **Empty `ALLOWED_NETWORKS` disables the filter** and logs a warning at startup. Fail-open is
+  deliberate so an existing deployment doesn't break on upgrade — set the variable in production.
+
+`TRUSTED_PROXY_COUNT` must match the real number of reverse proxies in front of the app:
+
+- `0` (default): the app receives direct connections; the TCP peer IP is used and
+  `X-Forwarded-For` is ignored (unspoofable).
+- `N > 0`: `ProxyFix(x_for=N)` takes the client IP from the Nth-from-the-right XFF entry.
+  **Setting this lower than the real proxy count is safe; setting it higher lets a client spoof
+  its IP with a forged header and bypass the allowlist entirely.**
+
+This is defence in depth, not the primary control — the network-level ACL (firewall / k8s
+NetworkPolicy / ingress) remains the real boundary.
 
 ### Security Considerations
 

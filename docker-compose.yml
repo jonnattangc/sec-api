@@ -1,7 +1,7 @@
 services:
     test-api:
       container_name: security-api
-      image: jonnattangc/secure:1.0.3
+      image: jonnattangc/secure:1.0.4
       build: .
       restart: always
       volumes:
@@ -12,6 +12,6 @@ services:
         - ../envs/security.env
       networks:
         - db-net
-      #command: tail -f /home/jonnattan/requirements.txt
+      command: tail -f /home/jonnattan/requirements.txt
 networks:
   db-net:

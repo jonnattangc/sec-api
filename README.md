@@ -1,701 +1,761 @@
-# API de Seguridad - Servidor OAuth2/JWT
+# API de Seguridad (`sec-api`) — Servidor OAuth2/JWT multi-tenant
 
-Servidor ligero basado en Flask para autenticación OAuth2 con JWT que gestiona credenciales de usuarios, validación multi-tenant por contrato y ciclo de vida de tokens JWT. Diseñado como proveedor centralizado de autenticación para servicios internos y microservicios.
+Servidor Flask que actúa como **proveedor centralizado de autenticación** para los sistemas SaaS
+de la plataforma. Gestiona:
 
-## Modelo multi-tenant (sistema + cliente + contrato)
+- **Autenticación** de usuarios (usuario/contraseña) aislada por cliente (*tenant*).
+- **Autorización comercial**: solo entra quien tiene un **contrato vigente** entre su empresa y el sistema.
+- **Ciclo de vida de sesiones JWT** (emisión, validación, rotación, revocación, purga), con sesiones
+  simultáneas **web** y **móvil**.
+- **Administración** (CRUD) de sistemas, tenants, contratos y usuarios, con dos niveles de administrador.
+- **Onboarding self-service**: un prospecto contrata un SaaS y recibe un contrato DEMO.
 
-La autenticación es multi-tenant y se apoya en dos identificadores enviados por cabecera:
+> **Modelo de tráfico: backend-a-backend.** Ningún navegador llama a esta API directamente. Cada
+> front-end tiene su propio backend, y ese backend es el único cliente de `sec-api`. Todos los
+> endpoints, incluido `/oauth/login`, se consideran internos.
 
-- **`x-api-key` → Sistema**: identifica el **sistema SaaS** que consume la API. Su valor es el `uuid` de la tabla `saas_system` (debe estar `ENABLED`).
-- **`client-id` → Cliente/Tenant**: identifica al **cliente**. Su valor es el `uuid` de la tabla `tenant`.
+---
 
-**Regla principal:** un usuario solo puede autenticarse si existe un **contrato vigente** entre su cliente (tenant) y el sistema, registrado en la tabla `tenant_contract` con estado `ACTIVE` o `DEMO` y sin vencer (`finish_at` nulo o futuro). Esta validación de contrato se aplica en `/login`, `/validate` y `/refresh`.
+## Índice
 
-## Características
+1. [Conceptos del dominio](#1-conceptos-del-dominio)
+2. [Reglas de negocio](#2-reglas-de-negocio)
+3. [Roles y permisos](#3-roles-y-permisos)
+4. [Sesiones, tokens y canales](#4-sesiones-tokens-y-canales)
+5. [Flujos](#5-flujos)
+6. [Referencia de endpoints](#6-referencia-de-endpoints)
+7. [Restricciones de seguridad transversales](#7-restricciones-de-seguridad-transversales)
+8. [Modelo de datos](#8-modelo-de-datos)
+9. [Configuración](#9-configuración)
+10. [Instalación y despliegue](#10-instalación-y-despliegue)
+11. [Semillas y pruebas locales](#11-semillas-y-pruebas-locales)
+12. [Observaciones y limitaciones conocidas](#12-observaciones-y-limitaciones-conocidas)
+13. [Solución de problemas](#13-solución-de-problemas)
 
-- **Autenticación de Usuarios**: Verificación de usuario/contraseña con hash bcrypt, aislada por tenant
-- **Autorización por contrato**: Login/validate/refresh exigen un contrato sistema↔cliente vigente
-- **Gestión de Tokens JWT**: Generación de tokens de acceso y refresco con TTL configurable; los claims incluyen `tenant` y `system`
-- **Revocación de Tokens**: Seguimiento y revocación de tokens mediante lista negra
-- **Refresco de Tokens**: Emisión de nuevos tokens de acceso usando refresh tokens
-- **Soporte CORS**: Manejo configurable de solicitudes entre orígenes
-- **Documentación Swagger**: Documentación interactiva de API vía Flasgger
+---
 
-## Inicio Rápido
+## 1. Conceptos del dominio
 
-### Requisitos Previos
+| Concepto | Tabla | Identificador público | Cómo viaja | Descripción |
+|---|---|---|---|---|
+| **Sistema SaaS** | `saas_system` | `uuid` | Cabecera `x-api-key` | Producto que consume la autenticación (p. ej. "Portal de Firmas", "consola"). Puede estar `ENABLED` o `DISABLED`, y ser `visible` o no en el catálogo. |
+| **Tenant / Cliente** | `tenant` | `uuid` (único) | Cabecera `client-id` | Empresa cliente. Los usuarios pertenecen a un tenant. |
+| **Contrato** | `tenant_contract` | `id` | — | Relación tenant ↔ sistema con estado (`ACTIVE`, `DEMO`, `INACTIVE`) y fecha de término opcional (`finish_at`). **Es lo que habilita el acceso.** |
+| **Usuario** | `oauth` | `username` (único **dentro** del tenant) | Body del login | Credencial, rol, `claims`, estado. El mismo `username` puede existir en varios tenants. |
+| **Sesión** | `user_jwt` | `id` = `jti` del access token | — | Una fila por sesión abierta. Guarda el access token vigente, el `jti` del refresh y el canal. |
+| **Tenant plataforma** | `tenant` | `uuid` = env `PLATFORM_TENANT_ID` | — | Tenant dueño de la plataforma. Sus usuarios `SUPERADMIN` son los super-admins. |
 
-- Python 3.10+
-- MySQL 5.7+
-- Docker & Docker Compose (opcional)
+---
 
-### Instalación
+## 2. Reglas de negocio
 
-1. **Clonar el repositorio**
-   ```bash
-   git clone <repository-url>
-   cd sec-api
-   ```
+### 2.1 Resolución de contexto (sistema + tenant + contrato)
 
-2. **Instalar dependencias**
-   ```bash
-   pip install -r requirements.txt
-   ```
+`/login`, `/validate` y `/refresh` resuelven el contexto con las mismas reglas, en este orden.
+Si cualquier paso falla, la respuesta es **`401 {"message": "No autorizado"}`**:
 
-3. **Configurar variables de entorno**
-   
-   Crear un archivo `.env` o establecer variables de entorno:
-   ```bash
-   # Configuración de Base de Datos
-   HOST_BD=localhost
-   PORT_BD=3306
-   USER_BD=root
-   PASS_BD=password
-   SCHEMA_BD=oauth_db
-   
-   # Configuración JWT
-   SECRET_KEY_JWT=tu-clave-super-secreta-cambia-en-produccion
-   EXPIRES_TOKEN_IN_SECONDS=300
-   
-   # Configuración de API
-   CONTEXT_PATH=/oauth
-   ```
+1. **Sistema**: `x-api-key` debe ser el `uuid` de un `saas_system` con `status = 'ENABLED'`.
+2. **Tenant**: `client-id` debe ser el `uuid` de un `tenant` existente.
+3. **Contrato vigente**: debe existir **al menos un** `tenant_contract` entre ese tenant y ese sistema que cumpla:
+   - `status IN ('ACTIVE', 'DEMO')` (`INACTIVE` no autoriza), y
+   - `finish_at IS NULL` o `finish_at > ahora` (se usa la hora local del servidor).
 
-4. **Configurar la base de datos**
-   
-   Crear las tablas requeridas:
-   ```sql
-   -- Sistemas SaaS que consumen la API (identificados por uuid vía x-api-key)
-   CREATE TABLE saas_system (
-     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-     name VARCHAR(255) NOT NULL,
-     visible TINYINT(1) NOT NULL,
-     uuid VARCHAR(255) NOT NULL,
-     status ENUM('ENABLED','DISABLED')
-   );
+> El contrato se **revalida en cada `/validate` y `/refresh`**. Si un contrato vence o se desactiva,
+> las sesiones existentes dejan de validar y de renovarse de inmediato, aunque el JWT siga sin expirar.
 
-   -- Clientes/tenants (identificados por uuid vía client-id)
-   CREATE TABLE tenant (
-     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-     name_company VARCHAR(255) NOT NULL,
-     uuid VARCHAR(255) NOT NULL UNIQUE,
-     razon_social VARCHAR(255),
-     contacto VARCHAR(255),
-     mail_contacto VARCHAR(255)
-   );
+### 2.2 Autenticación de usuario (login)
 
-   -- Contrato entre un tenant y un sistema (habilita el login)
-   CREATE TABLE tenant_contract (
-     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-     create_at DATETIME,
-     update_at DATETIME,
-     tenant_id BIGINT UNSIGNED,
-     system_id BIGINT UNSIGNED,
-     signature_id BIGINT UNSIGNED,
-     signature_date DATETIME,
-     finish_at DATETIME,
-     status ENUM('ACTIVE','INACTIVE','DEMO'),
-     FOREIGN KEY (tenant_id) REFERENCES tenant(id),
-     FOREIGN KEY (system_id) REFERENCES saas_system(id)
-   );
+- Se busca el usuario por `username` **dentro del tenant resuelto** y con `status = 'ACTIVE'`.
+  Los estados `INACTIVE`, `PENDING` y `BLOCKED` no pueden iniciar sesión.
+- La contraseña se verifica con `werkzeug.security.check_password_hash`.
+- Si el login funciona, se actualiza `oauth.last_login`.
+- Si falla, la respuesta es `401 {"message": "usuario inválido"}`. El mensaje es el mismo para
+  "usuario no existe" y "contraseña incorrecta", así que no permite enumerar usuarios.
 
-   -- Usuarios, aislados por tenant
-   CREATE TABLE oauth (
-     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-     create_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-     update_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-     username VARCHAR(255) NOT NULL,
-     password VARCHAR(255) NOT NULL,
-     last_login TIMESTAMP NULL,
-     status ENUM('ACTIVE','INACTIVE','PENDING','BLOCKED'),
-     role ENUM('SUPERADMIN','ADMIN','USER','QUERY') NOT NULL DEFAULT 'USER',
-     realname VARCHAR(255),
-     claims VARCHAR(255),
-     tenant_id BIGINT UNSIGNED NOT NULL,
-     FOREIGN KEY (tenant_id) REFERENCES tenant(id)
-   );
+### 2.3 Validación continua de la sesión
 
-   -- Seguimiento de tokens JWT: una fila por SESIÓN abierta
-   CREATE TABLE user_jwt (
-     id VARCHAR(255) PRIMARY KEY,
-     create_at TIMESTAMP NOT NULL,
-     update_at TIMESTAMP NOT NULL,
-     user_id BIGINT UNSIGNED,
-     status ENUM('ACTIVE','BLOCKED','EXPIRED') DEFAULT 'ACTIVE',
-     token TEXT NOT NULL,
-     refresh_id VARCHAR(255) NOT NULL,
-     channel ENUM('WEB','MOBILE') NOT NULL DEFAULT 'WEB',
-     FOREIGN KEY (user_id) REFERENCES oauth(id),
-     INDEX idx_user_jwt_user (user_id),
-     INDEX idx_user_jwt_refresh (refresh_id)
-   );
-   ```
+En cada `/validate` y `/refresh`, además del contrato, se comprueba que:
 
-   **Migración de una instalación existente** (sesiones simultáneas web + móvil):
+| Verificación | Si falla (`401`) |
+|---|---|
+| Claim `tenant` del JWT = `uuid` del tenant del header `client-id` | `Cliente y/o usuario no autorizado` |
+| Claim `system` del JWT = `uuid` del sistema del header `x-api-key` | `Sistema no autorizado` |
+| El usuario sigue existiendo en el tenant con `status = 'ACTIVE'` | `Rol o usuario no autorizado` |
+| El claim `role` del JWT coincide con el rol **actual** en BD (sin distinguir mayúsculas) | `Rol o usuario no autorizado` |
+| La sesión existe en `user_jwt` con `status = 'ACTIVE'` (para `/validate`, por el `jti` del access; para `/refresh`, por el `jti` del refresh) | `Token no autorizado` / `Invalid Refresh Token` |
 
-   ```sql
-   ALTER TABLE user_jwt
-     ADD COLUMN channel ENUM('WEB','MOBILE') NOT NULL DEFAULT 'WEB' AFTER refresh_id,
-     ADD INDEX idx_user_jwt_user (user_id),
-     ADD INDEX idx_user_jwt_refresh (refresh_id);
-   ```
+Consecuencias de negocio:
 
-5. **Ejecutar el servidor**
-   ```bash
-   python app/server.py 8079
-   ```
-   
-   La API estará disponible en `http://localhost:8079`
-   
-   Documentación Swagger disponible en `http://localhost:8079/apidocs/`
+- **Un token emitido para un sistema/tenant no sirve en otro**: los claims quedan atados al contexto del login.
+- **Cambiar el rol de un usuario o desactivarlo invalida sus sesiones** en `/validate` y `/refresh`,
+  sin tener que revocarlas.
+- En `/validate` se evalúan todas las reglas y gana el mensaje de la **última** que falla.
 
-### Despliegue con Docker
+### 2.4 Onboarding (alta self-service)
 
-1. **Construir la imagen**
-   ```bash
-   docker build -t security:prd .
-   ```
+`POST /oauth/register` crea en **una sola transacción** (todo o nada):
 
-2. **Ejecutar con docker-compose**
-   
-   Crear `envs/security.env`:
-   ```
-   HOST_BD=db
-   PORT_BD=3306
-   USER_BD=root
-   PASS_BD=rootpassword
-   SCHEMA_BD=oauth_db
-   SECRET_KEY_JWT=tu-clave-segura
-   EXPIRES_TOKEN_IN_SECONDS=300
-   CONTEXT_PATH=/oauth
-   ```
-   
-   Iniciar los contenedores:
-   ```bash
-   docker-compose up -d
-   ```
+1. Un `tenant` nuevo con `uuid` aleatorio (UUID v4).
+2. Un `tenant_contract` **`DEMO`** con el sistema elegido, vigente por `DEMO_TRIAL_DAYS` días (30 por defecto).
+3. El primer usuario del tenant con rol **`ADMIN`** (tenant-admin), estado `ACTIVE` y `claims` = `"RW"`
+   si no se envía otro valor.
 
-## Endpoints de la API
+Reglas:
+- Campos obligatorios: `system_uuid`, `company.name_company`, `user.username`, `user.password`. Si falta alguno → `400`.
+- El sistema debe estar `ENABLED`; si no → `404 Sistema no disponible`.
+- La respuesta entrega `client_id` y `x_api_key`, que son las cabeceras que el cliente usará en `/login`.
+- El usuario queda activo al instante (no hay verificación de correo ni aprobación manual).
+- Al vencer el DEMO, el login queda bloqueado hasta que un super-admin pase el contrato a `ACTIVE`
+  o extienda `finish_at`.
 
-> **Todos los endpoints requieren ambas cabeceras** `x-api-key` (uuid del sistema) y `client-id` (uuid del tenant). Si el sistema no está `ENABLED`, el cliente no existe o no hay contrato vigente entre ambos, la respuesta es `401 No autorizado`.
+### 2.5 Catálogo y búsqueda de empresa
 
-### 1. Iniciar Sesión
-**POST** `/oauth/login`
+- `GET /oauth/catalog` muestra solo los sistemas con `visible = 1` **y** `status = 'ENABLED'`, ordenados
+  por `order` ascendente (los que no tienen `order` van al final) y luego por `name`. Expone `name`,
+  `uuid`, `description`, `order` y `url`.
+- `POST /oauth/my-tenants` recibe un `username` (o `email`, que se trata como username) y devuelve los
+  tenants donde ese usuario tiene cuenta `ACTIVE` (`name_company` y `client_id`). Alimenta el selector
+  "ya soy cliente, elige tu empresa" antes del login.
 
-Autentica un usuario y obtiene tokens JWT. Requiere contrato vigente entre el cliente y el sistema.
+### 2.6 Bajas (borrado lógico vs. físico)
 
-**Encabezados:**
-```
-x-api-key: {uuid_del_sistema}
-client-id: {uuid_del_tenant}
-x-channel:  WEB | MOBILE        (opcional, WEB por omisión)
-Content-Type: application/json
-```
+| Recurso | `DELETE` hace | Efecto en sesiones |
+|---|---|---|
+| Sistema | `status = 'DISABLED'` (lógico) | Login, validate, refresh y logout fallan para ese sistema; desaparece del catálogo |
+| Contrato | `status = 'INACTIVE'` (lógico) | Validate y refresh empiezan a fallar al instante |
+| Usuario | `status = 'INACTIVE'` + borra **todas** sus filas de `user_jwt` | Todas sus sesiones (web y móvil) quedan revocadas |
+| Tenant | En una transacción: borra las sesiones de sus usuarios, desactiva usuarios y contratos y **elimina físicamente** el tenant | Todas las sesiones del tenant quedan revocadas (ver [§12](#12-observaciones-y-limitaciones-conocidas) sobre FKs) |
 
-`x-channel` declara desde dónde se abre la sesión y lo envía el backend dueño de ella,
-nunca el navegador. Cada login crea su **propia** sesión en `user_jwt`: un mismo usuario
-puede estar conectado a la vez en la consola web y en la aplicación móvil, y el logout de
-una no afecta a la otra. El refresh **rota** los tokens de esa sesión conservando su canal.
+---
 
-**Cuerpo de la Solicitud:**
+## 3. Roles y permisos
+
+### 3.1 Roles (`oauth.role`)
+
+| Rol | Significado |
+|---|---|
+| `SUPERADMIN` | Administra la plataforma completa. **Solo tiene efecto si el usuario pertenece al tenant plataforma.** |
+| `ADMIN` | Tenant-admin: administra los usuarios de **su propio** tenant. |
+| `USER` | Usuario final. Rol por defecto. |
+| `QUERY` | Usuario de solo consulta. |
+
+> `sec-api` no diferencia `USER` de `QUERY`. Ambos se emiten en el claim `role` (en minúsculas), y es el
+> sistema consumidor el que decide qué permite cada uno. Lo mismo ocurre con `claims` (texto libre como
+> `RW` o `R`), que viaja en el JWT en minúsculas.
+
+### 3.2 Super-admin: dos condiciones obligatorias
+
+Un JWT es de super-admin **solo si** se cumplen las dos condiciones:
+
+1. claim `role` = `superadmin`, **y**
+2. claim `tenant` = valor de la env `PLATFORM_TENANT_ID`.
+
+> ⚠️ El claim `tenant` es el **uuid** del tenant, por lo que `PLATFORM_TENANT_ID` debe contener el
+> **`tenant.uuid`** del tenant plataforma, no su id numérico. Si la variable no está definida, nadie es super-admin.
+
+Se exigen ambas condiciones a propósito. Si bastara el rol, un tenant-admin podría escalar privilegios
+creando un `SUPERADMIN` dentro de su propio tenant.
+
+### 3.3 Matriz de permisos
+
+| Operación | Público | ADMIN (tenant-admin) | SUPERADMIN de otro tenant | Super-admin real |
+|---|:-:|:-:|:-:|:-:|
+| Catálogo, my-tenants, register | ✅ | ✅ | ✅ | ✅ |
+| CRUD de sistemas | ❌ | ❌ | ❌ | ✅ |
+| CRUD de tenants | ❌ | ❌ | ❌ | ✅ |
+| CRUD de contratos | ❌ | ❌ | ❌ | ✅ |
+| CRUD de usuarios de **su** tenant | ❌ | ✅ | ✅ (como admin de su tenant) | ✅ |
+| CRUD de usuarios de **otro** tenant | ❌ | ❌ (`403`) | ❌ (`403`) | ✅ (indicando `tenant_id`) |
+| Asignar rol `SUPERADMIN` | ❌ | ❌ (`403`) | ❌ (`403`) | ✅ |
+
+Reglas específicas de usuarios:
+- **Tenant-admin**: queda forzado a su propio tenant. Si envía un `tenant_id` distinto del uuid de su
+  token, recibe `403 No autorizado para ese tenant`. Para leer, editar o borrar por `id`, el usuario
+  objetivo debe pertenecer a su tenant.
+- **Super-admin**: debe indicar `tenant_id` al crear (body) y al listar (`?tenant_id=`); si no lo hace →
+  `400`. Acepta el id numérico **o** el uuid del tenant.
+- Un usuario con rol `USER`/`QUERY` que llama a `/oauth/admin/*` recibe `403 Requiere rol ADMIN`.
+
+---
+
+## 4. Sesiones, tokens y canales
+
+### 4.1 Tokens emitidos
+
+| Token | Vida | Configuración |
+|---|---|---|
+| Access token | 300 s (5 min) | `EXPIRES_TOKEN_IN_SECONDS` |
+| Refresh token | 30 días | `REFRESH_EXPIRES_IN_DAYS` |
+
+Ambos se firman con HS256 usando `SECRET_KEY_JWT`. La identidad (`sub`) es el `username` y los claims
+adicionales son:
+
 ```json
 {
-  "username": "usuario",
-  "password": "contraseña_segura"
+  "tenant":  "<tenant.uuid>",
+  "system":  "<saas_system.uuid>",
+  "role":    "admin | superadmin | user | query",
+  "claims":  "rw",
+  "channel": "WEB | MOBILE"
 }
 ```
 
-**Respuesta Exitosa (200):**
+### 4.2 Una fila por sesión
+
+- Cada login crea **una fila nueva** en `user_jwt`. Un usuario puede tener varias sesiones abiertas a la
+  vez, incluso varias en el mismo canal, y **un login nuevo no expulsa a los anteriores**.
+- `user_jwt.id` = `jti` del access token; `user_jwt.refresh_id` = `jti` del refresh token.
+- **Rotación en el refresh**: se emite un par nuevo, se crea la fila nueva y se **borra la fila
+  anterior** (por `refresh_id`). El refresh y el access anteriores quedan inutilizables en `/validate`
+  y `/refresh` (el refresh token es de un solo uso).
+- **Logout**: borra la fila de la sesión (por `jti` del access). Eso invalida el access y el refresh
+  de **esa** sesión; las demás sesiones del usuario no se ven afectadas.
+- **Purga**: cada vez que se guarda una sesión, se borran las sesiones del usuario cuyo `update_at`
+  supera los `REFRESH_EXPIRES_IN_DAYS` días (ya no pueden renovarse).
+
+### 4.3 Canales (`x-channel`)
+
+- El backend consumidor declara el canal con la cabecera `x-channel: WEB | MOBILE` en el **login**.
+  Si falta o trae otro valor, se usa `WEB`.
+- En el refresh se **conserva el canal de la sesión** leído desde `user_jwt`, que tiene prioridad sobre
+  la cabecera.
+- `GET /oauth/admin/users` muestra en cada usuario sus sesiones agrupadas por canal:
+  `{channel, last_seen, online}`, donde `online = true` si la sesión se renovó en los últimos
+  `SESSION_ONLINE_MINUTES` (15 por defecto).
+
+### 4.4 Revocación (blocklist)
+
+En cada endpoint protegido con JWT se consulta `user_jwt`. El token se considera **revocado** si su fila
+existe con `status <> 'ACTIVE'` (p. ej. `BLOCKED` o `EXPIRED`). Para bloquear una sesión sin borrarla,
+basta con cambiar su `status`.
+
+---
+
+## 5. Flujos
+
+### 5.1 Onboarding y primer login
+
+```mermaid
+sequenceDiagram
+    participant P as Backend del prospecto
+    participant S as sec-api
+    participant DB as MySQL
+    P->>S: GET /oauth/catalog
+    S->>DB: saas_system (visible y ENABLED)
+    S-->>P: systems[] (uuid, name, description, url, order)
+    P->>S: POST /oauth/register {system_uuid, company, user}
+    S->>DB: valida sistema ENABLED
+    S->>DB: TX: INSERT tenant + tenant_contract(DEMO, +30d) + oauth(ADMIN)
+    S-->>P: 201 {client_id, x_api_key, user}
+    P->>S: POST /oauth/login (x-api-key, client-id, x-channel)
+    S-->>P: 200 {access_token, refresh_token, ...}
+```
+
+### 5.2 Login
+
+```mermaid
+sequenceDiagram
+    participant B as Backend consumidor
+    participant S as sec-api
+    participant DB as MySQL
+    B->>S: POST /oauth/login {username, password}<br/>x-api-key, client-id, x-channel
+    S->>S: filtro de red (ALLOWED_NETWORKS)
+    S->>DB: sistema ENABLED por uuid
+    S->>DB: tenant por uuid
+    S->>DB: contrato ACTIVE/DEMO no vencido
+    S->>DB: usuario ACTIVE en el tenant + check_password_hash
+    S->>DB: UPDATE last_login
+    S->>S: crea access + refresh (claims tenant/system/role/claims/channel)
+    S->>DB: INSERT user_jwt (sesión) + purga sesiones vencidas
+    S-->>B: 200 {access_token, refresh_token, user, client, system, channel}
+```
+
+### 5.3 Uso, renovación y cierre
+
+```mermaid
+sequenceDiagram
+    participant B as Backend consumidor
+    participant S as sec-api
+    B->>S: GET /oauth/validate (Bearer access)
+    S-->>B: 200 OK / 401 (contrato, claims, rol, sesión)
+    Note over B: el access expira a los 5 min
+    B->>S: GET /oauth/refresh (Bearer refresh)
+    S->>S: revalida contrato, claims, rol, refresh_id ACTIVE
+    S->>S: emite nuevo par, conserva canal, borra fila anterior
+    S-->>B: 200 {nuevo access, nuevo refresh}
+    B->>S: DELETE /oauth/logout (Bearer access)
+    S->>S: sistema y tenant resueltos (sin exigir contrato) y claims coincidentes
+    S-->>B: 200 Sesión cerrada (borra la fila de esa sesión)
+```
+
+### 5.4 Administración
+
+1. El administrador hace login normal (`/oauth/login`) contra su sistema y tenant. El super-admin lo
+   hace con el sistema "consola" y el tenant plataforma.
+2. Con el access token llama a `/oauth/admin/*` (`Authorization: Bearer <access>`).
+3. Los decoradores `admin_required` y `superadmin_required` deciden según los claims `role` y `tenant` del JWT.
+
+---
+
+## 6. Referencia de endpoints
+
+Todas las rutas cuelgan de `CONTEXT_PATH` (por defecto `/oauth`). Swagger UI está en
+**`/oauth/apidocs/`** y la spec en `/oauth/api_oauth.json`.
+
+### 6.1 Resumen
+
+| Método | Ruta | Autenticación | Cabeceras de contexto |
+|---|---|---|---|
+| GET | `/oauth/health` | — (exento del filtro de red) | — |
+| POST | `/oauth/login` | credenciales | `x-api-key`, `client-id`, `x-channel` (opc.) |
+| GET | `/oauth/validate` | Bearer **access** | `x-api-key`, `client-id` |
+| GET | `/oauth/refresh` | Bearer **refresh** | `x-api-key`, `client-id` |
+| DELETE | `/oauth/logout` | Bearer **access** | `x-api-key`, `client-id` |
+| GET | `/oauth/catalog` | — | — |
+| POST | `/oauth/my-tenants` | — | — |
+| POST | `/oauth/register` | — | — |
+| POST, GET | `/oauth/admin/systems` | Super-admin | — |
+| GET, PUT, DELETE | `/oauth/admin/systems/{id}` | Super-admin | — |
+| POST, GET | `/oauth/admin/tenants` | Super-admin | — |
+| GET, PUT, DELETE | `/oauth/admin/tenants/{id}` | Super-admin | — |
+| POST, GET | `/oauth/admin/contracts` (`?tenant_id=`) | Super-admin | — |
+| GET, PUT, DELETE | `/oauth/admin/contracts/{id}` | Super-admin | — |
+| POST, GET | `/oauth/admin/users` (`?tenant_id=`) | ADMIN / SUPERADMIN | — |
+| GET, PUT, DELETE | `/oauth/admin/users/{id}` | ADMIN / SUPERADMIN | — |
+
+> Los endpoints `/oauth/admin/*` **no** usan `x-api-key`/`client-id` ni revalidan el contrato: confían
+> solo en los claims del JWT (ver [§12](#12-observaciones-y-limitaciones-conocidas)).
+
+### 6.2 Health — `GET /oauth/health`
+
+Ejecuta `SELECT 1` contra la BD.
+- `200 {"status": "UP", "database": "UP"}`
+- `503 {"status": "DOWN", "database": "DOWN", "detail": "..."}`
+
+### 6.3 Login — `POST /oauth/login`
+
+```bash
+curl -X POST http://localhost:8079/oauth/login \
+  -H "x-api-key: <saas_system.uuid>" \
+  -H "client-id: <tenant.uuid>" \
+  -H "x-channel: WEB" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "usuario", "password": "secreta"}'
+```
+
+Respuesta `200`:
 ```json
 {
   "access_token": "eyJhbGc...",
   "refresh_token": "eyJhbGc...",
-  "user": {
-    "username": "usuario",
-    "realname": "Nombre Real",
-    "role": "USER",
-    "claims": "RW",
-    "status": "ACTIVE",
-    "last_login": "2026-04-19 10:30:00"
-  },
-  "client": {
-    "name_company": "Mi Empresa",
-    "razon_social": "Mi Empresa S.A.",
-    "contacto": "Juan Pérez",
-    "mail_contacto": "contacto@miempresa.com"
-  },
-  "system": {
-    "name": "notification",
-    "visible": 1
-  }
+  "channel": "WEB",
+  "user":   { "username": "usuario", "full_name": "Nombre Real", "role": "USER",
+              "claims": "RW", "status": "ACTIVE", "last_login": "2026-04-19 10:30:00" },
+  "client": { "name_company": "Mi Empresa", "razon_social": "Mi Empresa S.A.",
+              "contacto": "Juan Pérez", "mail_contacto": "contacto@miempresa.com" },
+  "system": { "name": "notification", "visible": 1, "description": "...", "url": "...",
+              "order": 10, "created_at": "...", "updated_at": "..." }
 }
 ```
 
-> Nota: por seguridad, los campos internos (`id`, `uuid`, `tenant_id`, `password`, `create_at`, `update_at`) se eliminan de la respuesta.
+Campos que **nunca** se devuelven: en `user` → `id`, `uuid`, `tenant_id`, `password`, `create_at`,
+`update_at`; en `client` → `id`, `uuid`; en `system` → `id`, `uuid`, `status`.
 
-**Respuesta de Error (401):**
+| Código | Causa |
+|---|---|
+| `401 No autorizado` | Sistema no `ENABLED`, tenant inexistente o sin contrato vigente |
+| `401 usuario inválido` | Usuario inexistente, no `ACTIVE` en el tenant o contraseña incorrecta |
+| `403` | IP de origen fuera de `ALLOWED_NETWORKS` |
+| `415` | Body sin `Content-Type: application/json` |
+
+### 6.4 Validar — `GET /oauth/validate`
+
+Requiere un **access token** (con un refresh token devuelve error de tipo de token). Aplica todas las
+reglas de [§2.3](#23-validación-continua-de-la-sesión).
+- `200 {"message": "OK", "user": {...}, "client": {...}, "system": {...}}` (datos ya sin campos internos).
+- `401` con uno de: `No autorizado`, `Cliente y/o usuario no autorizado`, `Sistema no autorizado`,
+  `Rol o usuario no autorizado`, `Token no autorizado`, `Tu sesión ha expirado`.
+
+### 6.5 Refrescar — `GET /oauth/refresh`
+
+Requiere un **refresh token**. Revalida el contrato, los claims, el rol y el estado del usuario, y que el
+`refresh_id` siga `ACTIVE`. Devuelve la misma estructura que el login con un par **nuevo**; el par
+anterior deja de funcionar.
+
+| Código | Causa |
+|---|---|
+| `401 No autorizado` | Contexto/contrato inválido |
+| `401 Cliente y/o usuario no autorizado` / `Sistema no autorizado` | Claims no coinciden con las cabeceras |
+| `401 Rol o usuario no autorizado para el refresh` | Usuario inactivo o rol cambiado |
+| `401 Invalid Refresh Token` | Sesión cerrada, rotada o purgada |
+
+### 6.6 Logout — `DELETE /oauth/logout`
+
+Requiere un **access token**. El sistema (`ENABLED`) y el tenant deben resolverse desde las cabeceras y
+coincidir con los claims del token. **No exige contrato vigente**, para que un usuario siempre pueda
+cerrar su sesión. Borra solo la sesión de ese token.
+- `200 {"message": "Sesión cerrada con exito"}`
+- `401 No autorizado` / `401 Token no autorizado para este cliente/sistema`
+
+### 6.7 Catálogo — `GET /oauth/catalog`
+
 ```json
-{
-  "message": "No autorizado"
-}
+{ "systems": [ { "name": "Portal de Firmas", "uuid": "87eb...", "description": "...",
+                 "order": 10, "url": "https://firmas.jonna.cl" } ] }
 ```
 
-### 2. Validar Token
-**GET** `/oauth/validate`
+### 6.8 Mis empresas — `POST /oauth/my-tenants`
 
-Verifica que un token sea válido, que el contrato siga vigente y que el usuario tenga acceso adecuado.
-
-**Encabezados:**
-```
-Authorization: Bearer {access_token}
-x-api-key: {uuid_del_sistema}
-client-id: {uuid_del_tenant}
-```
-
-**Respuesta Exitosa (200):**
 ```json
-{
-  "message": "OK",
-  "user": { "username": "usuario", "role": "USER", "claims": "RW", "status": "ACTIVE" },
-  "client": { "name_company": "Mi Empresa" },
-  "system": { "name": "notification" }
-}
+// request
+{ "username": "jonnattan" }
+// 200
+{ "tenants": [ { "name_company": "Mi Empresa", "client_id": "<tenant.uuid>" } ] }
 ```
+`400` si falta `username`.
 
-**Respuesta de Error (401):**
-```json
-{
-  "message": "Token no autorizado"
-}
-```
+### 6.9 Registro — `POST /oauth/register`
 
-### 3. Refrescar Token
-**GET** `/oauth/refresh`
-
-Genera un nuevo token de acceso usando un refresh token válido. Revalida el contrato vigente.
-
-**Encabezados:**
-```
-Authorization: Bearer {refresh_token}
-x-api-key: {uuid_del_sistema}
-client-id: {uuid_del_tenant}
-```
-
-**Respuesta Exitosa (200):**
-```json
-{
-  "access_token": "eyJhbGc...",
-  "refresh_token": "eyJhbGc...",
-  "user": {
-    "username": "usuario",
-    "role": "USER",
-    "claims": "RW",
-    "status": "ACTIVE"
-  },
-  "client": {
-    "name_company": "Mi Empresa"
-  },
-  "system": {
-    "name": "notification"
-  }
-}
-```
-
-**Respuesta de Error (401):**
-```json
-{
-  "message": "Tu sesión ha expirado"
-}
-```
-
-### 4. Cerrar Sesión
-**DELETE** `/oauth/logout`
-
-Revoca el token de acceso actual e invalida la sesión. Valida que el token pertenezca al cliente/sistema indicados (no exige contrato vigente).
-
-**Encabezados:**
-```
-Authorization: Bearer {access_token}
-x-api-key: {uuid_del_sistema}
-client-id: {uuid_del_tenant}
-```
-
-**Respuesta Exitosa (200):**
-```json
-{
-  "message": "Sesión cerrada con éxito"
-}
-```
-
-**Respuesta de Error (401):**
-```json
-{
-  "message": "No se encontró un token de acceso. Debes iniciar sesión."
-}
-```
-
-## Administración y Onboarding (self-service)
-
-Además del ciclo OAuth existen servicios para **autogestión** (un prospecto contrata un SaaS del
-catálogo) y **administración** (CRUD de usuarios, tenants, sistemas y contratos).
-
-### Modelo de roles
-
-- **Super-admin**: usuario con `role='ADMIN'` que pertenece al *tenant plataforma* (definido por la
-  env `PLATFORM_TENANT_ID`). Gestiona sistemas, tenants y contratos, y usuarios de cualquier tenant.
-- **Tenant-admin**: usuario con `role='ADMIN'` de un tenant normal. Gestiona **solo los usuarios de
-  su propio tenant**. El primer usuario creado en el onboarding es un tenant-admin.
-
-Los endpoints de administración se protegen con el **JWT** emitido por `/oauth/login` (rol ADMIN).
-
-### Endpoints públicos (onboarding)
-
-**GET** `/oauth/catalog` — lista los sistemas SaaS contratables (visibles y habilitados).
-```json
-{ "systems": [ { "name": "sms_resent", "uuid": "87ebf297-..." } ] }
-```
-
-**POST** `/oauth/register` — alta self-service. Crea el tenant, un contrato `DEMO` y el primer
-usuario ADMIN, todo activo de inmediato.
 ```bash
 curl -X POST http://localhost:8079/oauth/register -H "Content-Type: application/json" -d '{
   "system_uuid": "87ebf297-...",
-  "company": { "name_company": "Mi Empresa", "mail_contacto": "contacto@miempresa.com" },
-  "user": { "username": "admin", "password": "secreta", "full_name": "Juan Pérez" }
+  "company": { "name_company": "Mi Empresa", "razon_social": "Mi Empresa S.A.",
+               "contacto": "Juan Pérez", "mail_contacto": "contacto@miempresa.com" },
+  "user": { "username": "admin", "password": "secreta", "full_name": "Juan Pérez", "claims": "RW" }
 }'
 ```
-Respuesta `201` (usar `client_id` y `x_api_key` para el `/oauth/login`):
-```json
-{ "message": "Registro exitoso", "client_id": "<tenant.uuid>", "x_api_key": "<system.uuid>", "user": { "...": "..." } }
-```
+- `201 {"message": "Registro exitoso", "client_id": "<tenant.uuid>", "x_api_key": "<system.uuid>", "user": {...}}`
+- `400` faltan datos o falló la transacción; `404` sistema no disponible.
 
-### Endpoints de administración (requieren `Authorization: Bearer <JWT ADMIN>`)
+### 6.10 Administración de sistemas (super-admin)
 
-| Recurso | Endpoints | Rol requerido |
-|---|---|---|
-| Sistemas SaaS | `POST/GET /oauth/admin/systems`, `GET/PUT/DELETE /oauth/admin/systems/{id}` | Super-admin |
-| Tenants | `POST/GET /oauth/admin/tenants`, `GET/PUT/DELETE /oauth/admin/tenants/{id}` | Super-admin |
-| Contratos | `POST/GET /oauth/admin/contracts`, `GET/PUT/DELETE /oauth/admin/contracts/{id}` | Super-admin |
-| Usuarios | `POST/GET /oauth/admin/users`, `GET/PUT/DELETE /oauth/admin/users/{id}` | ADMIN (aislado por tenant) |
+| Endpoint | Body / reglas |
+|---|---|
+| `POST /admin/systems` | `name` (obligatorio), `visible` (0/1, por defecto 1), `status` (`ENABLED`/`DISABLED`, por defecto `ENABLED`), `description`, `url`, `order` (entero). El `uuid` se genera (v4). → `201` |
+| `GET /admin/systems` | Lista **todos** (incluye ocultos y deshabilitados), con `uuid` y `status`. |
+| `GET /admin/systems/{id}` | `404` si no existe. |
+| `PUT /admin/systems/{id}` | Actualización parcial de `name`, `visible`, `status`, `description`, `url`, `order`. Los campos `null` se ignoran. Actualiza `updated_at`. |
+| `DELETE /admin/systems/{id}` | Baja lógica → `DISABLED`. |
 
-Notas:
-- `DELETE` de sistemas → baja lógica (`status='DISABLED'`); de usuarios → `status='INACTIVE'` + revoca
-  tokens; de contratos → `status='INACTIVE'`. `DELETE` de tenant elimina en cascada controlada
-  (desactiva sus contratos y usuarios, revoca tokens).
-- Para usuarios, el **super-admin** debe indicar `tenant_id` (en body al crear, en `?tenant_id=` al
-  listar); el **tenant-admin** queda forzado a su propio tenant (intentar otro devuelve `403`).
-  El `tenant_id` se acepta como id numérico **o** como uuid del tenant (el claim `tenant` del JWT
-  es el uuid, y así ambas formas resuelven la misma empresa).
-- `GET /oauth/admin/users` agrega a cada usuario sus **sesiones abiertas**, una por canal:
+### 6.11 Administración de tenants (super-admin)
 
-  ```json
-  { "id": 7, "username": "ana", "role": "ADMIN", "status": "ACTIVE",
-    "sessions": [ { "channel": "WEB",    "last_seen": "2026-07-28 09:12:03", "online": true  },
-                  { "channel": "MOBILE", "last_seen": "2026-07-27 22:10:44", "online": false } ] }
-  ```
+| Endpoint | Body / reglas |
+|---|---|
+| `POST /admin/tenants` | `name_company` (obligatorio), `razon_social`, `contacto`, `mail_contacto`. El `uuid` se genera (v4). **No** crea contrato ni usuarios. → `201` |
+| `GET /admin/tenants`, `GET /admin/tenants/{id}` | Lectura (incluye `id` y `uuid`). |
+| `PUT /admin/tenants/{id}` | Actualización parcial de los 4 campos anteriores. El `uuid` no se puede cambiar. |
+| `DELETE /admin/tenants/{id}` | Cascada controlada (ver [§2.6](#26-bajas-borrado-lógico-vs-físico)). |
 
-  `online` es verdadero cuando la sesión renovó sus tokens dentro de los últimos
-  `SESSION_ONLINE_MINUTES`; una sesión vigente pero inactiva se informa con `online: false`.
+### 6.12 Administración de contratos (super-admin)
 
-Ejemplo (tenant-admin crea un usuario en su tenant):
+| Endpoint | Body / reglas |
+|---|---|
+| `POST /admin/contracts` | `tenant_id`, `system_id` (ids numéricos, obligatorios), `status` (por defecto `DEMO`), `finish_at` (`YYYY-MM-DD HH:MM:SS`, opcional = sin vencimiento). `signature_date` = ahora. → `201` |
+| `GET /admin/contracts[?tenant_id=]` | Lista, opcionalmente filtrada por tenant (id numérico). |
+| `PUT /admin/contracts/{id}` | Actualización parcial de `status`, `finish_at`, `tenant_id`, `system_id`. |
+| `DELETE /admin/contracts/{id}` | Baja lógica → `INACTIVE`. |
+
+Se permiten varios contratos para el mismo par tenant-sistema; para autorizar basta con que uno esté vigente.
+
+### 6.13 Administración de usuarios (ADMIN / SUPERADMIN)
+
+| Endpoint | Body / reglas |
+|---|---|
+| `POST /admin/users` | `username`, `password` (obligatorios), `role` (por defecto `USER`), `status` (por defecto `ACTIVE`), `full_name`, `claims`, `tenant_id` (solo super-admin). `409` si el `username` ya existe en el tenant **en cualquier estado**. |
+| `GET /admin/users[?tenant_id=]` | Usuarios del tenant, sin `password`, con `sessions[]` por canal. |
+| `GET /admin/users/{id}` | Sin `password`. `403` si es de otro tenant (para no super-admins). |
+| `PUT /admin/users/{id}` | Parcial: `role`, `status`, `full_name`, `claims`, `username`, `password` (reset, se vuelve a hashear). |
+| `DELETE /admin/users/{id}` | Baja lógica → `INACTIVE` + revoca todas sus sesiones. |
+
+Validaciones: `role ∈ {SUPERADMIN, ADMIN, USER, QUERY}`, `status ∈ {ACTIVE, INACTIVE, PENDING, BLOCKED}`;
+solo un super-admin puede asignar `SUPERADMIN` (`403` en otro caso).
+
+---
+
+## 7. Restricciones de seguridad transversales
+
+### 7.1 Restricción por red de origen
+
+`restrict_by_network()` (un `before_request`) rechaza con `403 {"message": "Acceso denegado: origen no
+autorizado"}` toda petición cuya IP no esté en `ALLOWED_NETWORKS`.
+
+- **Se aplica a**: todos los endpoints.
+- **Quedan exentos**: `<CONTEXT_PATH>/health` (las probes de kubelet llegan desde la IP del nodo), el
+  preflight CORS (`OPTIONS`) y las rutas listadas en `PUBLIC_PATHS` (comparación exacta de path;
+  vacío por defecto).
+- **Si `ALLOWED_NETWORKS` está vacío, el filtro queda DESACTIVADO** y se avisa en el log al arrancar.
+  El fail-open es deliberado para no romper despliegues existentes; **defínela en producción**.
+
+`TRUSTED_PROXY_COUNT` debe coincidir con el número real de reverse proxies delante de la app:
+- `0` (por defecto): se usa la IP del peer TCP y se ignora `X-Forwarded-For` (no se puede falsear).
+- `N > 0`: `ProxyFix(x_for=N)` toma la IP del N-ésimo valor desde la derecha de `X-Forwarded-For`.
+  **Configurarlo por debajo del número real de proxies es seguro; por encima, permite que un cliente
+  falsee su IP con una cabecera forjada y se salte la allowlist.**
+
+Esto es defensa en profundidad. La frontera real sigue siendo la ACL de red (firewall, NetworkPolicy de
+k8s o ingress).
+
+### 7.2 Contraseñas
+
+Se hashean con `werkzeug.security.generate_password_hash` (en Werkzeug 3.x el algoritmo por defecto es
+**scrypt**) y se verifican con `check_password_hash`. Nunca se guardan ni se devuelven en claro.
+**Los hashes bcrypt (`$2b$...`) no son compatibles**: para sembrar usuarios, genera el hash con Werkzeug:
+
 ```bash
-curl -X POST http://localhost:8079/oauth/admin/users \
-  -H "Authorization: Bearer <JWT_ADMIN>" -H "Content-Type: application/json" \
-  -d '{ "username": "operador", "password": "secreta", "role": "USER", "claims": "R" }'
+python -c "from werkzeug.security import generate_password_hash as g; print(g('mi-clave'))"
 ```
 
-### Semilla del super-admin / plataforma
+La API no aplica política de fortaleza de contraseñas; debe hacerlo el backend consumidor.
 
-El super-admin obtiene su JWT vía el `/oauth/login` normal, por lo que el tenant plataforma necesita
-un sistema "consola" y un contrato activo:
+### 7.3 CORS
+
+Orígenes permitidos configurables con `CORS_ORIGINS` (lista separada por comas). Valor por defecto:
+`dev.jonnattan.com`, `api.jonnatech.cl`, `www.jonnatech.cl`, `api.jonnattan.cl`, `www.jonna.cl`,
+`www.jonnattan.cl`, `api.jonna.cl`, `docs.jonna.cl`, `docs.jonnattan.cl` (todos `https`). Dado el modelo
+backend-a-backend, CORS solo es relevante para Swagger UI.
+
+### 7.4 Mensajes de error JWT
+
+| Situación | Respuesta |
+|---|---|
+| Token expirado | `401 Tu sesión ha expirado` |
+| Token mal formado o con firma inválida | `401 El token de seguridad no es válido. Acceso denegado.` |
+| Sin token | `401 No se encontró un token de acceso. Debes iniciar sesión.` |
+| Sesión con `status <> ACTIVE` | `401` (token revocado) |
+
+---
+
+## 8. Modelo de datos
+
 ```sql
-INSERT INTO saas_system (name, visible, uuid, status)
-  VALUES ('console', 0, UUID(), 'ENABLED');
+-- Sistemas SaaS (uuid -> cabecera x-api-key). Timestamps sin default: los fija admin.py.
+CREATE TABLE saas_system (
+  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(255) NOT NULL,
+  visible     TINYINT(1)   NOT NULL,
+  uuid        VARCHAR(255) NOT NULL,
+  status      ENUM('ENABLED','DISABLED'),
+  description VARCHAR(255),
+  url         VARCHAR(255),
+  `order`     INT,                     -- palabra reservada: siempre con backticks
+  created_at  DATETIME,
+  updated_at  DATETIME
+);
+
+-- Clientes/tenants (uuid -> cabecera client-id)
+CREATE TABLE tenant (
+  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name_company  VARCHAR(255) NOT NULL,
+  uuid          VARCHAR(255) NOT NULL UNIQUE,
+  razon_social  VARCHAR(255),
+  contacto      VARCHAR(255),
+  mail_contacto VARCHAR(255)
+);
+
+-- Contrato tenant <-> sistema (habilita el acceso)
+CREATE TABLE tenant_contract (
+  id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  create_at      DATETIME,
+  update_at      DATETIME,
+  tenant_id      BIGINT UNSIGNED,
+  system_id      BIGINT UNSIGNED,
+  signature_id   BIGINT UNSIGNED,
+  signature_date DATETIME,
+  finish_at      DATETIME,             -- NULL = sin vencimiento
+  status         ENUM('ACTIVE','INACTIVE','DEMO'),
+  FOREIGN KEY (tenant_id) REFERENCES tenant(id),
+  FOREIGN KEY (system_id) REFERENCES saas_system(id)
+);
+
+-- Usuarios, aislados por tenant
+CREATE TABLE oauth (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  create_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  update_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  username   VARCHAR(255) NOT NULL,
+  password   VARCHAR(255) NOT NULL,   -- hash Werkzeug (scrypt/pbkdf2)
+  last_login TIMESTAMP NULL,
+  status     ENUM('ACTIVE','INACTIVE','PENDING','BLOCKED'),
+  role       ENUM('SUPERADMIN','ADMIN','USER','QUERY') NOT NULL DEFAULT 'USER',
+  full_name  VARCHAR(255),
+  claims     VARCHAR(255),
+  tenant_id  BIGINT UNSIGNED NOT NULL,
+  FOREIGN KEY (tenant_id) REFERENCES tenant(id)
+);
+
+-- Sesiones JWT: una fila por sesión abierta
+CREATE TABLE user_jwt (
+  id         VARCHAR(255) PRIMARY KEY,           -- jti del access token
+  create_at  TIMESTAMP NOT NULL,
+  update_at  TIMESTAMP NOT NULL,                 -- última emisión/rotación
+  user_id    BIGINT UNSIGNED,
+  status     ENUM('ACTIVE','BLOCKED','EXPIRED') DEFAULT 'ACTIVE',
+  token      TEXT NOT NULL,                      -- access token vigente
+  refresh_id VARCHAR(255) NOT NULL,              -- jti del refresh token
+  channel    ENUM('WEB','MOBILE') NOT NULL DEFAULT 'WEB',
+  FOREIGN KEY (user_id) REFERENCES oauth(id),
+  INDEX idx_user_jwt_user (user_id),
+  INDEX idx_user_jwt_refresh (refresh_id)
+);
+```
+
+**Migración de una instalación existente** (sesiones simultáneas web + móvil). Sin la columna `channel`
+la sesión no se guarda: el login entrega tokens, pero `/validate` y `/refresh` responden `401`. El
+servidor lo avisa al arrancar:
+
+```sql
+ALTER TABLE user_jwt
+  ADD COLUMN channel ENUM('WEB','MOBILE') NOT NULL DEFAULT 'WEB' AFTER refresh_id,
+  ADD INDEX idx_user_jwt_user (user_id),
+  ADD INDEX idx_user_jwt_refresh (refresh_id);
+```
+
+---
+
+## 9. Configuración
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `HOST_BD` | — | Host MySQL |
+| `PORT_BD` | — (obligatoria) | Puerto MySQL (habitualmente 3306) |
+| `USER_BD` / `PASS_BD` | — | Credenciales MySQL |
+| `SCHEMA_BD` | — | Esquema |
+| `SECRET_KEY_JWT` | `super-secret-key-aca-debe-ir` | Clave de firma JWT. **⚠️ Cambiar en producción.** |
+| `EXPIRES_TOKEN_IN_SECONDS` | `300` | Vida del access token |
+| `REFRESH_EXPIRES_IN_DAYS` | `30` | Vida del refresh token y umbral de purga de sesiones |
+| `SESSION_ONLINE_MINUTES` | `15` | Ventana para reportar una sesión como `online` |
+| `CONTEXT_PATH` | `/oauth` | Prefijo de **todas** las rutas (la administración cuelga de `<CONTEXT_PATH>/admin`) |
+| `PLATFORM_TENANT_ID` | — | **uuid** del tenant plataforma. Sin él no hay super-admin. |
+| `DEMO_TRIAL_DAYS` | `30` | Días del contrato DEMO del onboarding |
+| `ALLOWED_NETWORKS` | vacío (filtro OFF) | CIDRs permitidos, separados por coma |
+| `TRUSTED_PROXY_COUNT` | `0` | Número de reverse proxies de confianza |
+| `PUBLIC_PATHS` | vacío | Rutas exactas exentas del filtro de red |
+| `CORS_ORIGINS` | lista de dominios propios | Orígenes CORS, separados por coma |
+
+---
+
+## 10. Instalación y despliegue
+
+### Requisitos
+- Python 3.10+ (la imagen Docker usa `python:3.14-alpine`)
+- MySQL 5.7+
+
+### Local
+```bash
+pip install -r requirements.txt
+export HOST_BD=localhost PORT_BD=3306 USER_BD=root PASS_BD=secret SCHEMA_BD=oauth_db \
+       SECRET_KEY_JWT=cambia-esto PLATFORM_TENANT_ID=<uuid-tenant-plataforma>
+python app/server.py 8079          # el puerto es obligatorio como argumento
+```
+- API: `http://localhost:8079/oauth/...`
+- Swagger: `http://localhost:8079/oauth/apidocs/`
+
+Al arrancar, el servidor revisa que exista `user_jwt.channel` y registra en el log las redes permitidas
+(o avisa de que el filtro de red está desactivado).
+
+### Docker
+```bash
+docker build -t security:prd .     # expone 8080, CMD: python server.py 8080
+docker-compose up -d               # mapea 8079:8080, lee ../envs/security.env
+docker-compose logs -f test-api
+```
+> El `docker-compose.yml` sobrescribe el comando con `tail -f` y monta `./app` como volumen: es un
+> entorno de desarrollo, y el servidor se lanza a mano dentro del contenedor. La imagen (`Dockerfile`)
+> sí arranca el servidor directamente.
+
+---
+
+## 11. Semillas y pruebas locales
+
+### Plataforma y super-admin
+```sql
+INSERT INTO saas_system (name, visible, uuid, status, created_at, updated_at)
+  VALUES ('console', 0, UUID(), 'ENABLED', NOW(), NOW());     -- visible=0: fuera del catálogo
 INSERT INTO tenant (name_company, uuid) VALUES ('Plataforma', UUID());
-INSERT INTO tenant_contract (create_at, tenant_id, system_id, status)
-  VALUES (NOW(), <platform_tenant_id>, <console_system_id>, 'ACTIVE');
+INSERT INTO tenant_contract (create_at, update_at, tenant_id, system_id, status)
+  VALUES (NOW(), NOW(), <platform_tenant_id>, <console_system_id>, 'ACTIVE');
 INSERT INTO oauth (username, password, status, role, tenant_id)
-  VALUES ('superadmin', '<hash_bcrypt>', 'ACTIVE', 'ADMIN', <platform_tenant_id>);
+  VALUES ('superadmin', '<hash_werkzeug>', 'ACTIVE', 'SUPERADMIN', <platform_tenant_id>);
 ```
-Luego define `PLATFORM_TENANT_ID=<platform_tenant_id>` y haz login con
-`x-api-key=<uuid-consola>` y `client-id=<uuid-plataforma>`.
+Luego define `PLATFORM_TENANT_ID=<uuid del tenant Plataforma>` y haz login con
+`x-api-key=<uuid de console>` y `client-id=<uuid de Plataforma>`.
 
-## Flujo de Autenticación
-
-```
-┌─────────────┐
-│   Cliente   │
-└──────┬──────┘
-       │
-       │ 1. POST /oauth/login (usuario + contraseña + x-api-key + client-id)
-       ↓
-┌──────────────────────────────┐
-│ Resolver Sistema (x-api-key)  │  saas_system.uuid, status=ENABLED
-└────────┬─────────────────────┘
-         │
-         │ 2. Resolver Cliente/Tenant (client-id) → tenant.uuid
-         ↓
-┌──────────────────────────────┐
-│ Verificar Contrato Vigente    │  tenant_contract (ACTIVE/DEMO, no vencido)
-└────────┬─────────────────────┘
-         │
-         │ 3. Verificar credenciales del usuario en oauth (aislado por tenant_id)
-         ↓
-┌────────────────────┐
-│ Generar JWT Pair   │  claims: tenant, system, role, claims
-└────────┬───────────┘
-         │
-         │ 4. Crear access_token + refresh_token
-         ↓
-┌────────────────────────────┐
-│ Guardar Tokens en BD       │  tabla user_jwt (por user_id)
-└────────┬───────────────────┘
-         │
-         │ 5. Retornar tokens + user + client + system (sin campos internos)
-         ↓
-┌─────────────┐
-│   Cliente   │
-└─────────────┘
-```
-
-## Ejemplos de Uso
-
-### Con cURL
-
-**Iniciar sesión:**
-```bash
-curl -X POST http://localhost:8079/oauth/login \
-  -H "x-api-key: uuid_del_sistema" \
-  -H "client-id: uuid_del_tenant" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "username": "usuario",
-    "password": "contraseña_segura"
-  }'
-```
-
-**Validar token:**
-```bash
-curl -X GET http://localhost:8079/oauth/validate \
-  -H "Authorization: Bearer eyJhbGc..." \
-  -H "x-api-key: uuid_del_sistema" \
-  -H "client-id: uuid_del_tenant"
-```
-
-**Refrescar token:**
-```bash
-curl -X GET http://localhost:8079/oauth/refresh \
-  -H "Authorization: Bearer refresh_token_aqui" \
-  -H "x-api-key: uuid_del_sistema" \
-  -H "client-id: uuid_del_tenant"
-```
-
-**Cerrar sesión:**
-```bash
-curl -X DELETE http://localhost:8079/oauth/logout \
-  -H "Authorization: Bearer access_token_aqui" \
-  -H "x-api-key: uuid_del_sistema" \
-  -H "client-id: uuid_del_tenant"
-```
-
-### Con Python
-
+### Ejemplo de ciclo completo (Python)
 ```python
 import requests
+BASE = "http://localhost:8079/oauth"
+H = {"x-api-key": "<system.uuid>", "client-id": "<tenant.uuid>", "x-channel": "WEB"}
 
-BASE_URL = "http://localhost:8079"
-SYSTEM_UUID = "uuid_del_sistema"   # x-api-key -> saas_system.uuid
-TENANT_UUID = "uuid_del_tenant"    # client-id -> tenant.uuid
+r = requests.post(f"{BASE}/login", headers=H, json={"username": "usuario", "password": "secreta"}).json()
+access, refresh = r["access_token"], r["refresh_token"]
 
-BASE_HEADERS = {"x-api-key": SYSTEM_UUID, "client-id": TENANT_UUID}
-
-# 1. Iniciar sesión
-login_response = requests.post(
-    f"{BASE_URL}/oauth/login",
-    headers=BASE_HEADERS,
-    json={
-        "username": "usuario",
-        "password": "contraseña_segura"
-    }
-)
-
-tokens = login_response.json()
-access_token = tokens["access_token"]
-refresh_token = tokens["refresh_token"]
-
-# 2. Validar token
-validate_response = requests.get(
-    f"{BASE_URL}/oauth/validate",
-    headers={**BASE_HEADERS, "Authorization": f"Bearer {access_token}"}
-)
-
-print(validate_response.json())
-
-# 3. Refrescar token
-refresh_response = requests.get(
-    f"{BASE_URL}/oauth/refresh",
-    headers={**BASE_HEADERS, "Authorization": f"Bearer {refresh_token}"}
-)
-
-new_access_token = refresh_response.json()["access_token"]
-
-# 4. Cerrar sesión
-logout_response = requests.delete(
-    f"{BASE_URL}/oauth/logout",
-    headers={**BASE_HEADERS, "Authorization": f"Bearer {access_token}"}
-)
-
-print(logout_response.json())
+requests.get(f"{BASE}/validate", headers={**H, "Authorization": f"Bearer {access}"})
+r = requests.get(f"{BASE}/refresh", headers={**H, "Authorization": f"Bearer {refresh}"}).json()
+access = r["access_token"]          # el par anterior ya no sirve
+requests.delete(f"{BASE}/logout", headers={**H, "Authorization": f"Bearer {access}"})
 ```
 
-## Configuración
+---
 
-### Variables de Entorno
+## 12. Observaciones y limitaciones conocidas
 
-| Variable | Por Defecto | Descripción |
-|----------|-------------|-------------|
-| `HOST_BD` | - | Host de la base de datos MySQL |
-| `PORT_BD` | 3306 | Puerto de la base de datos MySQL |
-| `USER_BD` | - | Usuario de la base de datos MySQL |
-| `PASS_BD` | - | Contraseña de la base de datos MySQL |
-| `SCHEMA_BD` | - | Nombre del esquema de la base de datos |
-| `SECRET_KEY_JWT` | `super-secret-key-aca-debe-ir` | Clave para firmar JWT (⚠️ cambiar en producción) |
-| `EXPIRES_TOKEN_IN_SECONDS` | 300 | Tiempo de expiración del token de acceso en segundos |
-| `REFRESH_EXPIRES_IN_DAYS` | 30 | Vigencia del refresh token; las sesiones que lo superan se purgan de `user_jwt` |
-| `SESSION_ONLINE_MINUTES` | 15 | Minutos sin renovar tras los cuales una sesión deja de reportarse "en línea" |
-| `CONTEXT_PATH` | `/oauth` | Ruta base de **todos** los endpoints; administración cuelga de ella (`/oauth/admin`) |
-| `PLATFORM_TENANT_ID` | - | Id del tenant plataforma; sus usuarios ADMIN son super-admins |
-| `DEMO_TRIAL_DAYS` | 30 | Días de vigencia del contrato DEMO creado en el onboarding |
+Comportamientos que se desprenden del código actual y conviene tener en cuenta (no son cambios, solo documentación):
 
-### Configuración CORS
+1. **Los endpoints `/oauth/admin/*` confían solo en el JWT.** No revalidan contrato, sistema, estado ni
+   rol del usuario en BD, y la blocklist solo marca como revocadas las sesiones con `status <> 'ACTIVE'`,
+   no las **borradas**. Por eso, tras un logout, un `DELETE` de usuario o un cambio de rol, el access
+   token sigue funcionando en la administración hasta que expire (≤ `EXPIRES_TOKEN_IN_SECONDS`).
+   `/validate` y `/refresh` sí lo rechazan.
+2. **`DELETE /admin/tenants/{id}` con el esquema documentado**: `oauth.tenant_id` y
+   `tenant_contract.tenant_id` son FKs sin `ON DELETE`, así que el borrado físico del tenant falla si
+   tiene usuarios o contratos. Toda la transacción hace rollback y la API responde `404 No encontrado`.
+3. **`update_login` actualiza `last_login` por `username` sin filtrar por tenant**: si el mismo
+   username existe en varios tenants, el login en uno actualiza `last_login` en todos.
+4. **`PUT /admin/users/{id}` permite cambiar `username` sin comprobar duplicados** dentro del tenant
+   (el `POST` sí lo comprueba).
+5. **Tenant-admin y `tenant_id` numérico**: el tenant-admin solo puede enviar su propio **uuid** (o
+   no enviar nada). Si envía su id numérico recibe `403`, porque se compara con el claim `tenant` (uuid).
+6. **`/oauth/register` no exige que el sistema sea `visible`**: basta con que esté `ENABLED`. Quien
+   conozca el uuid de un sistema oculto (p. ej. `console`) puede registrarse en él. Igual queda como
+   tenant-admin de un tenant nuevo, sin privilegios de plataforma.
+7. **`/oauth/my-tenants` es público** y revela en qué empresas existe un username. Lo mitiga el filtro
+   de red y el modelo backend-a-backend.
+8. **Sin rate limiting** en `/login`, `/register` ni `/my-tenants`: debe aplicarse en el backend
+   consumidor o en el ingress.
+9. **`app.run(debug=True)`** también en la imagen Docker: en producción conviene un servidor WSGI
+   (gunicorn, etc.) sin modo debug.
+10. **Logout requiere el sistema `ENABLED`**: si el sistema se deshabilita, sus sesiones no pueden
+    cerrarse por la API (igualmente ya no validan ni se renuevan).
+11. Cada petición con JWT abre **conexiones nuevas a MySQL** (una por instancia de `Security`, más la
+    de la blocklist). No hay pool de conexiones.
 
-La API permite solicitudes desde los siguientes orígenes:
-- `https://dev.jonnattan.com`
-- `https://api.jonnattan.cl`
-- `https://www.jonna.cl`
-- `https://www.jonnattan.cl`
-- `https://api.jonna.cl`
-- `https://docs.jonna.cl`
-- `https://docs.jonnattan.cl`
+---
 
-Para modificar, edita la línea `cors = CORS(...)` en `app/server.py`.
+## 13. Solución de problemas
 
-## Consideraciones de Seguridad
+| Síntoma | Revisar |
+|---|---|
+| `401 No autorizado` en login | `x-api-key` = uuid de un sistema `ENABLED`; `client-id` = uuid de un tenant existente; contrato `ACTIVE`/`DEMO` con `finish_at` nulo o futuro |
+| `401 usuario inválido` | Usuario `ACTIVE` en **ese** tenant; hash generado con Werkzeug (no bcrypt) |
+| El login entrega tokens pero `/validate` y `/refresh` siempre responden `401` | Falta la columna `user_jwt.channel`: la sesión no se guarda (ver migración en §8) |
+| `403 Acceso denegado: origen no autorizado` | IP fuera de `ALLOWED_NETWORKS`; `TRUSTED_PROXY_COUNT` mal configurado |
+| `403 Requiere super-admin` | Rol `SUPERADMIN` **y** `PLATFORM_TENANT_ID` = **uuid** del tenant del token |
+| `/validate` responde `Rol o usuario no autorizado` | Cambió el rol del usuario o ya no está `ACTIVE`: hay que volver a hacer login |
+| `Invalid Refresh Token` | Refresh ya rotado (es de un solo uso), sesión cerrada o purgada (> `REFRESH_EXPIRES_IN_DAYS`) |
+| Sin conexión a BD | `HOST_BD`, `PORT_BD` (obligatoria), `USER_BD`, `PASS_BD`, `SCHEMA_BD`; `GET /oauth/health` |
 
-### Seguridad de Contraseñas
-- Las contraseñas se cifran con **bcrypt** vía `generate_password_hash()` de werkzeug
-- Las contraseñas en texto plano nunca se almacenan en la base de datos
-- Implementa requisitos de fortaleza de contraseña en tu aplicación cliente
+---
 
-### Seguridad JWT
-- Los tokens se firman con una clave secreta (`SECRET_KEY_JWT`)
-- **⚠️ Cambia la clave secreta por defecto en producción**
-- Los tokens de acceso tienen TTL configurable (por defecto: 300 segundos / 5 minutos)
-- Los refresh tokens tienen mayor validez y se almacenan en BD para seguimiento de revocación
-- Los tokens se invalidan cuando los usuarios cierran sesión
-
-### Gestión de Identificadores (Sistema y Cliente)
-- El **sistema** se identifica con `x-api-key` = `saas_system.uuid` (debe estar `ENABLED`)
-- El **cliente/tenant** se identifica con `client-id` = `tenant.uuid` (único por cliente)
-- Ambas cabeceras son requeridas en todos los endpoints (`/login`, `/validate`, `/refresh`, `/logout`)
-- El acceso efectivo lo habilita un **contrato vigente** en `tenant_contract`
-- Implementa políticas de rotación de los uuid de sistema/cliente
-
-### Mejores Prácticas
-
-1. **Usa HTTPS en producción** - Los tokens son sensibles y deben transmitirse de forma segura
-2. **TTL corto para tokens de acceso** - Usa tiempos de expiración cortos y refresh tokens para sesiones más largas
-3. **Almacenamiento seguro de secretos** - Usa variables de entorno o sistemas de gestión de secretos para `SECRET_KEY_JWT`
-4. **Seguridad de la base de datos** - Limita el acceso, usa credenciales fuertes, habilita SSL/TLS para conexiones BD
-5. **Rate limiting** - Implementa límite de tasas en el endpoint `/login` para prevenir ataques de fuerza bruta
-6. **Logging** - Monitorea logs de autenticación para actividad sospechosa
-
-## Desarrollo
-
-### Estructura del Proyecto
+## Estructura del proyecto
 
 ```
 sec-api/
 ├── app/
-│   ├── server.py          # Aplicación Flask principal, endpoints OAuth y registro de blueprints
-│   ├── security.py        # Lógica de autenticación y gestión de tokens
-│   ├── admin.py           # Clase Admin: CRUD de sistemas/tenants/contratos/usuarios + onboarding
-│   └── routes.py          # Blueprints de administración (/oauth/admin) y onboarding público (/oauth)
-├── requirements.txt       # Dependencias de Python
-├── Dockerfile            # Definición de imagen del contenedor
-├── docker-compose.yml    # Configuración de Docker Compose
-├── CLAUDE.md             # Guía para Claude Code
-└── README.md             # Este archivo
+│   ├── server.py     # App Flask: config JWT/CORS/Swagger, filtro de red, health, login/validate/refresh/logout
+│   ├── security.py   # Security: conexión BD, contexto (sistema/tenant/contrato), credenciales, sesiones
+│   ├── admin.py      # Admin(Security): CRUD de sistemas/tenants/contratos/usuarios + onboarding
+│   └── routes.py     # Blueprints: público (/oauth) y admin (/oauth/admin) + decoradores de rol
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
 ```
-
-### Pruebas Locales
-
-1. Crea un sistema de prueba en `saas_system`:
-   ```sql
-   INSERT INTO saas_system (name, visible, uuid, status)
-   VALUES ('sistema_prueba', 1, 'uuid-sistema-prueba', 'ENABLED');
-   ```
-
-2. Crea un cliente/tenant de prueba en `tenant`:
-   ```sql
-   INSERT INTO tenant (name_company, uuid) VALUES ('Empresa de Prueba', 'uuid-tenant-prueba');
-   ```
-
-3. Registra un contrato vigente entre ambos en `tenant_contract`:
-   ```sql
-   INSERT INTO tenant_contract (create_at, tenant_id, system_id, status)
-   VALUES (NOW(), <tenant_id>, <system_id>, 'ACTIVE');  -- o 'DEMO'
-   ```
-
-4. Crea un usuario de prueba asociado al tenant en `oauth`:
-   ```sql
-   INSERT INTO oauth (username, password, status, role, tenant_id)
-   VALUES ('usuario_prueba', '...hash_bcrypt...', 'ACTIVE', 'USER', <tenant_id>);
-   ```
-
-Usa los uuid del sistema y del tenant como `x-api-key` y `client-id` en los ejemplos de cURL o Python.
-
-### Logging
-
-La aplicación registra todos los eventos de autenticación en stdout con formato:
-```
-2026-04-19 10:30:00,123 INFO : Cliente: Mi Empresa
-```
-
-Ver logs en Docker:
-```bash
-docker-compose logs -f test-api
-```
-
-## Solución de Problemas
-
-### Problemas de Conexión a Base de Datos
-- Verifica que MySQL esté ejecutándose y sea accesible
-- Verifica variables de entorno (`HOST_BD`, `PORT_BD`, `USER_BD`, `PASS_BD`, `SCHEMA_BD`)
-- Asegúrate de que el esquema de la base de datos exista y las tablas estén creadas
-
-### Fallos de Autenticación
-- Verifica que el `x-api-key` corresponda a un `saas_system.uuid` con `status='ENABLED'`
-- Verifica que el `client-id` corresponda a un `tenant.uuid` existente
-- Asegúrate de que exista un contrato vigente en `tenant_contract` (estado `ACTIVE`/`DEMO`, `finish_at` nulo o futuro) entre ese tenant y ese sistema
-- Asegúrate de que el usuario exista en la tabla `oauth` con `status='ACTIVE'` y el `tenant_id` correcto
-- Confirma que el hash de la contraseña sea válido (usa bcrypt para crear usuarios de prueba)
-
-### Validación de Token Falla
-- Asegúrate de que el token existe en la tabla `user_jwt` con `status='ACTIVE'`
-- Verifica que el token no haya expirado (`create_at + EXPIRES_TOKEN_IN_SECONDS`)
-- Comprueba que el token no fue revocado por logout
-
-### Puerto Already in Use (Ya en Uso)
-Cambia el puerto al ejecutar localmente:
-```bash
-python app/server.py 8080
-```
-
-## Soporte
-
-Para problemas, preguntas o contribuciones, abre un issue en el repositorio.
-
-## Licencia
-
-[Añade tu información de licencia aquí]
